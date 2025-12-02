@@ -505,6 +505,369 @@ from sam3d_objects.data.dataset.tdfy.img_and_mask_transforms import SSIPointmapN
 from sam3d_objects.utils.visualization.scene_visualizer import SceneVisualizer
 
 
+def compute_camera_poses_from_object_poses(
+    all_view_poses: List[dict],
+) -> List[dict]:
+    """
+    从物体在各视角相机坐标系中的 pose 计算相机位姿。
+    
+    假设：
+    1. 物体在世界坐标系中是静止的
+    2. View 0 的相机坐标系就是世界坐标系
+    
+    数学推导（使用 4x4 齐次变换矩阵）：
+    
+    定义：
+    - M_obj_to_c0 = [R_0, T_0; 0, 1]：物体从 canonical space 到 View 0 相机坐标系的变换
+    - M_obj_to_ci = [R_i, T_i; 0, 1]：物体从 canonical space 到 View i 相机坐标系的变换
+    
+    求解目标：
+    - M_ci_to_c0：View i 相机坐标系到 View 0 相机坐标系（世界坐标系）的变换
+      这就是 camera-to-world (c2w) 矩阵
+    
+    推导：
+    利用物体坐标系作为桥接：Ci -> Object -> C0
+    
+    M_ci_to_c0 = M_obj_to_c0 @ inv(M_obj_to_ci)
+    
+    展开：
+    - inv(M_obj_to_ci) = [R_i^T, -R_i^T @ T_i; 0, 1]
+    - M_ci_to_c0 = [R_0, T_0; 0, 1] @ [R_i^T, -R_i^T @ T_i; 0, 1]
+                = [R_0 @ R_i^T, R_0 @ (-R_i^T @ T_i) + T_0; 0, 1]
+                = [R_0 @ R_i^T, T_0 - R_0 @ R_i^T @ T_i; 0, 1]
+    
+    结论（camera-to-world）：
+    - R_c2w = R_0 @ R_i^T
+    - T_c2w = T_0 - R_0 @ R_i^T @ T_i
+    
+    Args:
+        all_view_poses: 每个视角解码后的 pose 列表
+            每个 pose 包含: translation (3,), rotation (4,) [wxyz quaternion], scale (3,)
+    
+    Returns:
+        List of camera poses, each containing:
+            - c2w: (4, 4) camera-to-world matrix
+            - w2c: (4, 4) world-to-camera matrix
+    """
+    from scipy.spatial.transform import Rotation
+    
+    num_views = len(all_view_poses)
+    
+    # ========================================
+    # 坐标系修正: 仅用于相机位姿计算
+    # ========================================
+    # 问题：SAM3D 的 Translation 是 Y-up (PyTorch3D) 的，但 Rotation 可能是 Z-up 定义的。
+    # 当直接使用原始 quaternion 计算相对旋转 (R_0 @ R_i^T) 时，如果坐标系不一致，
+    # 会导致相机位姿计算错误（相机挤在一起，而不是环绕分布）。
+    #
+    # 修正：将 Z-up 的 quaternion 转换为 Y-up 的等效旋转
+    # 变换：[w, x, y, z] -> [w, x, z, -y]
+    # 这相当于绕 X 轴旋转 -90 度，将 Z-up 映射到 Y-up
+    # ========================================
+    
+    # 提取并修正 View 0 的 pose 作为参考（定义世界坐标系）
+    pose_0 = all_view_poses[0]
+    T_0 = np.array(pose_0['translation']).flatten()[:3]
+    quat_0 = np.array(pose_0['rotation']).flatten()[:4]  # wxyz
+    w, x, y, z = quat_0
+    quat_0_fixed = np.array([w, x, z, -y])  # 修正
+    quat_0_scipy = np.array([quat_0_fixed[1], quat_0_fixed[2], quat_0_fixed[3], quat_0_fixed[0]])
+    R_0 = Rotation.from_quat(quat_0_scipy).as_matrix()
+    
+    logger.info(f"[Camera Pose] Reference (View 0 - Fixed):")
+    logger.info(f"  T_0: {T_0}")
+    logger.info(f"  R_0 euler (deg): {Rotation.from_matrix(R_0).as_euler('xyz', degrees=True)}")
+    
+    camera_poses = []
+    
+    # 先处理 View 0（作为参考/世界坐标系，相机位姿应该是单位变换）
+    c2w_0 = np.eye(4)
+    c2w_0[:3, :3] = np.eye(3)  # View 0 的相机 = 世界坐标系
+    c2w_0[:3, 3] = np.zeros(3)  # 相机位置在原点
+    
+    camera_poses.append({
+        'view_idx': 0,
+        'c2w': c2w_0,
+        'w2c': np.eye(4),  # w2c 也是单位矩阵
+        'R_c2w': np.eye(3),
+        't_c2w': np.zeros(3),
+        'camera_position': np.zeros(3),
+    })
+    
+    logger.info(f"[Camera Pose] View 0:")
+    logger.info(f"  Object pose: T={T_0}, R_euler={Rotation.from_matrix(R_0).as_euler('xyz', degrees=True)}")
+    logger.info(f"  Camera position (world): [0, 0, 0] (reference)")
+    
+    # 处理其他视角
+    for view_idx in range(1, num_views):
+        pose = all_view_poses[view_idx]
+        
+        T_i = np.array(pose['translation']).flatten()[:3]
+        quat_i = np.array(pose['rotation']).flatten()[:4]  # wxyz
+        
+        # 应用相同的修正
+        w, x, y, z = quat_i
+        quat_i_fixed = np.array([w, x, z, -y])
+        quat_i_scipy = np.array([quat_i_fixed[1], quat_i_fixed[2], quat_i_fixed[3], quat_i_fixed[0]])
+        R_i = Rotation.from_quat(quat_i_scipy).as_matrix()
+        
+        # 计算 camera-to-world (c2w) 变换
+        # 正确公式：R_c2w = R_0 @ R_i^T, T_c2w = T_0 - R_0 @ R_i^T @ T_i
+        R_c2w = R_0 @ R_i.T
+        T_c2w = T_0 - R_0 @ R_i.T @ T_i
+        
+        # 构建 camera-to-world 矩阵
+        c2w = np.eye(4)
+        c2w[:3, :3] = R_c2w
+        c2w[:3, 3] = T_c2w
+        
+        # 构建 world-to-camera 矩阵 (c2w 的逆)
+        w2c = np.linalg.inv(c2w)
+        
+        # 相机在世界坐标系中的位置就是 c2w 的平移部分
+        camera_position = T_c2w
+        
+        # 计算相机旋转角度（相对于 View 0）
+        rot_angle_deg = np.rad2deg(np.arccos(np.clip((np.trace(R_c2w) - 1) / 2, -1, 1)))
+        
+        camera_poses.append({
+            'view_idx': view_idx,
+            'c2w': c2w,
+            'w2c': w2c,
+            'R_c2w': R_c2w,
+            't_c2w': T_c2w,
+            'camera_position': camera_position,
+        })
+        
+        logger.info(f"[Camera Pose] View {view_idx}:")
+        logger.info(f"  Object pose: T={T_i}, R_euler={Rotation.from_quat(quat_i_scipy).as_euler('xyz', degrees=True)}")
+        logger.info(f"  Camera c2w rotation angle from View 0: {rot_angle_deg:.1f} deg")
+        logger.info(f"  Camera position (world): {camera_position}")
+    
+    return camera_poses
+
+
+def create_camera_frustum(
+    c2w: np.ndarray,
+    scale: float = 0.1,
+    color: List[int] = [255, 0, 0, 255],
+):
+    """
+    创建相机锥体的 mesh 用于可视化。
+    
+    相机坐标系约定（PyTorch3D）：
+    - X: 左
+    - Y: 上  
+    - Z: 前（相机看向 +Z）
+    
+    Args:
+        c2w: (4, 4) camera-to-world 矩阵
+        scale: 锥体大小
+        color: RGBA 颜色
+    
+    Returns:
+        trimesh.Trimesh 表示的相机锥体
+    """
+    import trimesh
+    
+    # 相机锥体的顶点（在相机坐标系中）
+    # 相机在原点，看向 +Z 方向
+    h = scale  # 锥体高度（沿 Z 轴）
+    w = scale * 0.6  # 锥体宽度
+    
+    # 锥体朝向 +Z
+    vertices_cam = np.array([
+        [0, 0, 0],           # 0: 相机中心
+        [-w, -w, h],         # 1: 左下（远平面）
+        [w, -w, h],          # 2: 右下
+        [w, w, h],           # 3: 右上
+        [-w, w, h],          # 4: 左上
+    ])
+    
+    # 变换到世界坐标系
+    vertices_world = (c2w[:3, :3] @ vertices_cam.T).T + c2w[:3, 3]
+    
+    # 定义面（三角形）
+    faces = np.array([
+        [0, 2, 1],  # 底面三角形1 (reversed winding for correct normals)
+        [0, 3, 2],  # 底面三角形2
+        [0, 4, 3],  # 底面三角形3
+        [0, 1, 4],  # 底面三角形4
+        [1, 2, 3],  # 远平面三角形1
+        [1, 3, 4],  # 远平面三角形2
+    ])
+    
+    mesh = trimesh.Trimesh(vertices=vertices_world, faces=faces, process=False)
+    mesh.visual.face_colors = color
+    
+    return mesh
+
+
+def visualize_object_with_cameras(
+    sam3d_glb_path: Path,
+    object_pose: dict,
+    camera_poses: List[dict],
+    output_path: Optional[Path] = None,
+    camera_scale: float = 0.1,
+) -> Optional[Path]:
+    """
+    可视化物体和所有相机的位置。
+    
+    坐标系说明：
+    - SAM3D 的 pose 是在 PyTorch3D 相机坐标系中的（X-左, Y-上, Z-前）
+    - 我们以 View 0 的相机坐标系作为世界坐标系
+    - 物体被变换到这个坐标系中
+    - 相机位姿也是相对于这个坐标系的
+    
+    Args:
+        sam3d_glb_path: SAM3D 输出的 GLB 文件路径
+        object_pose: 物体在世界坐标系（View 0 相机坐标系）中的 pose
+        camera_poses: 每个视角的相机位姿
+        output_path: 输出路径
+        camera_scale: 相机锥体的大小
+    
+    Returns:
+        输出的 GLB 文件路径
+    """
+    try:
+        import trimesh
+    except ImportError:
+        logger.warning("trimesh not installed, cannot create visualization")
+        return None
+    
+    if not sam3d_glb_path.exists():
+        logger.warning(f"SAM3D GLB not found: {sam3d_glb_path}")
+        return None
+    
+    if output_path is None:
+        output_path = sam3d_glb_path.parent / "result_with_cameras.glb"
+    
+    try:
+        # 加载 SAM3D GLB
+        sam3d_scene = trimesh.load(str(sam3d_glb_path))
+        
+        # 提取顶点
+        canonical_vertices = None
+        canonical_faces = None
+        if isinstance(sam3d_scene, trimesh.Scene):
+            for name, geom in sam3d_scene.geometry.items():
+                if hasattr(geom, 'vertices'):
+                    canonical_vertices = geom.vertices.copy()
+                    if hasattr(geom, 'faces'):
+                        canonical_faces = geom.faces.copy()
+                    break
+        elif hasattr(sam3d_scene, 'vertices'):
+            canonical_vertices = sam3d_scene.vertices.copy()
+            if hasattr(sam3d_scene, 'faces'):
+                canonical_faces = sam3d_scene.faces.copy()
+        
+        if canonical_vertices is None:
+            logger.warning("No vertices found in SAM3D GLB")
+            return None
+        
+        # 提取 pose 参数
+        scale = np.array(object_pose.get('scale', [1, 1, 1])).flatten()[:3]
+        translation = np.array(object_pose.get('translation', [0, 0, 0])).flatten()[:3]
+        rotation_quat = np.array(object_pose.get('rotation', [1, 0, 0, 0])).flatten()[:4]  # wxyz
+        
+        logger.info(f"[Viz] Object pose: scale={scale}, translation={translation}")
+        logger.info(f"[Viz] Object rotation (wxyz): {rotation_quat}")
+        
+        # Z-up to Y-up 旋转（SAM3D canonical space 是 Z-up）
+        z_up_to_y_up = np.array([
+            [1, 0, 0],
+            [0, 0, -1],
+            [0, 1, 0],
+        ], dtype=np.float32)
+        
+        # 构建 pose 变换
+        quat_tensor = torch.tensor(rotation_quat, dtype=torch.float32).unsqueeze(0)
+        R_obj = quaternion_to_matrix(quat_tensor).squeeze(0).numpy()
+        
+        # 变换顶点到 View 0 相机坐标系（PyTorch3D）
+        # 1. Z-up to Y-up
+        v_rotated = canonical_vertices @ z_up_to_y_up.T
+        # 2. Scale
+        if len(scale) == 1:
+            scale = np.array([scale[0], scale[0], scale[0]])
+        v_scaled = v_rotated * scale
+        # 3. Rotate
+        v_rotated2 = v_scaled @ R_obj.T
+        # 4. Translate
+        v_final = v_rotated2 + translation
+        
+        logger.info(f"[Viz] Object center: {v_final.mean(axis=0)}")
+        logger.info(f"[Viz] Object bounds: [{v_final.min(axis=0)}, {v_final.max(axis=0)}]")
+        
+        # 创建场景
+        merged_scene = trimesh.Scene()
+        
+        # 添加物体
+        if canonical_faces is not None:
+            obj_mesh = trimesh.Trimesh(vertices=v_final, faces=canonical_faces, process=False)
+            obj_mesh.visual.face_colors = [200, 200, 200, 255]  # 灰色
+        else:
+            obj_mesh = trimesh.PointCloud(v_final, colors=[200, 200, 200, 255])
+        merged_scene.add_geometry(obj_mesh, node_name="object")
+        
+        # 添加坐标轴（帮助理解方向）
+        # X 轴 - 红色
+        # Y 轴 - 绿色
+        # Z 轴 - 蓝色
+        axis_length = camera_scale * 2
+        axis_vertices = np.array([
+            [0, 0, 0], [axis_length, 0, 0],  # X
+            [0, 0, 0], [0, axis_length, 0],  # Y
+            [0, 0, 0], [0, 0, axis_length],  # Z
+        ])
+        axis_colors = np.array([
+            [255, 0, 0, 255], [255, 0, 0, 255],  # X - 红
+            [0, 255, 0, 255], [0, 255, 0, 255],  # Y - 绿
+            [0, 0, 255, 255], [0, 0, 255, 255],  # Z - 蓝
+        ])
+        axis_pc = trimesh.PointCloud(axis_vertices, colors=axis_colors)
+        merged_scene.add_geometry(axis_pc, node_name="world_axes")
+        
+        # 添加相机
+        colors_per_view = [
+            [255, 0, 0, 255],     # View 0: 红
+            [0, 255, 0, 255],     # View 1: 绿
+            [0, 0, 255, 255],     # View 2: 蓝
+            [255, 255, 0, 255],   # View 3: 黄
+            [255, 0, 255, 255],   # View 4: 品红
+            [0, 255, 255, 255],   # View 5: 青
+            [255, 128, 0, 255],   # View 6: 橙
+            [128, 0, 255, 255],   # View 7: 紫
+        ]
+        
+        for cam_pose in camera_poses:
+            view_idx = cam_pose['view_idx']
+            c2w = np.array(cam_pose['c2w'])
+            color = colors_per_view[view_idx % len(colors_per_view)]
+            
+            # 相机位置
+            cam_pos = c2w[:3, 3]
+            # 相机朝向（Z 轴方向）
+            cam_dir = c2w[:3, 2]  # 第三列是 Z 轴方向
+            
+            logger.info(f"[Viz] Camera {view_idx}: pos={cam_pos}, dir={cam_dir}")
+            
+            frustum = create_camera_frustum(c2w, scale=camera_scale, color=color)
+            merged_scene.add_geometry(frustum, node_name=f"camera_{view_idx}")
+        
+        # 导出
+        merged_scene.export(str(output_path))
+        logger.info(f"[Viz] Saved: {output_path}")
+        
+        return output_path
+        
+    except Exception as e:
+        logger.warning(f"Failed to create visualization: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def overlay_sam3d_on_pointmap(
     sam3d_glb_path: Path,
     input_pointmap,
@@ -808,6 +1171,12 @@ def run_weighted_inference(
     merge_da3_glb: bool = False,
     # Overlay visualization
     overlay_pointmap: bool = False,
+    # Per-view pose optimization
+    optimize_per_view_pose: bool = False,
+    # Camera pose estimation
+    estimate_camera_pose: bool = False,
+    pose_refine_steps: int = 50,
+    camera_pose_mode: str = "fixed_shape",
 ):
     """
     Run weighted inference.
@@ -922,6 +1291,27 @@ def run_weighted_inference(
         logger.warning("Single view detected - weighting is not applicable, using standard inference")
         use_weighting = False
     
+    # Check parameter conflicts
+    # 1. --merge_da3_glb requires --da3_output
+    if merge_da3_glb and da3_output_path is None:
+        raise ValueError(
+            "Parameter conflict: --merge_da3_glb requires --da3_output.\n"
+            "  --merge_da3_glb needs DA3's scene.glb to merge with SAM3D output.\n"
+            "  Please provide: --da3_output <path_to_da3_output.npz>\n"
+            "  Or remove --merge_da3_glb."
+        )
+    
+    # 2. --optimize_per_view_pose requires --da3_output with extrinsics
+    if optimize_per_view_pose:
+        if da3_extrinsics is None:
+            raise ValueError(
+                "Parameter conflict: --optimize_per_view_pose requires --da3_output with valid extrinsics.\n"
+                "  --optimize_per_view_pose needs camera extrinsics to visualize multi-view pose consistency.\n"
+                "  Please provide: --da3_output <path_to_da3_output.npz>\n"
+                "  Or remove --optimize_per_view_pose to use default mode."
+            )
+        logger.info("Per-view pose optimization enabled: each view will iterate its own pose")
+    
     output_dir = get_output_dir(input_path, mask_prompt, image_names, is_single_view, use_weighting, entropy_alpha)
     
     # Setup logging
@@ -1008,12 +1398,80 @@ def run_weighted_inference(
             # Save Stage 2 init for stability analysis
             save_stage2_init=save_stage2_init,
             save_stage2_init_path=output_dir / "stage2_init.pt" if save_stage2_init else None,
+            # Per-view pose optimization
+            optimize_per_view_pose=optimize_per_view_pose,
         )
         weight_manager = result.get("weight_manager")
         
         # Log if stage2_init was saved
         if save_stage2_init and (output_dir / "stage2_init.pt").exists():
             logger.info(f"Stage 2 initial latent saved to: {output_dir / 'stage2_init.pt'}")
+        
+        # Camera pose estimation (Stage 2: refine pose per view)
+        if estimate_camera_pose:
+            logger.info("=" * 60)
+            logger.info(f"Camera Pose Estimation (mode: {camera_pose_mode})")
+            logger.info("=" * 60)
+            
+            # 获取 view_ss_input_dicts（需要从 result 中获取）
+            view_ss_input_dicts = result.get('view_ss_input_dicts', None)
+            if view_ss_input_dicts is None:
+                logger.warning("view_ss_input_dicts not found in result, cannot estimate poses")
+            else:
+                if camera_pose_mode == "fixed_shape":
+                    # 方法 A：固定多视角融合的 shape，只优化 pose
+                    if 'shape' not in result:
+                        logger.warning("shape not found in result, cannot use fixed_shape mode")
+                    else:
+                        logger.info("[Mode: fixed_shape] Fix multi-view fused shape, refine pose only")
+                        fixed_shape_latent = result['shape']
+                        
+                        all_view_poses_raw = inference._pipeline.refine_pose_per_view(
+                            view_ss_input_dicts=view_ss_input_dicts,
+                            fixed_shape_latent=fixed_shape_latent,
+                            inference_steps=pose_refine_steps,
+                        )
+                
+                elif camera_pose_mode == "independent":
+                    # 方法 B：每个视角完全独立优化 shape + pose
+                    logger.info("[Mode: independent] Each view optimizes shape+pose independently")
+                    
+                    all_view_poses_raw = inference._pipeline.estimate_pose_independent(
+                        view_ss_input_dicts=view_ss_input_dicts,
+                        inference_steps=pose_refine_steps,
+                    )
+                
+                else:
+                    logger.error(f"Unknown camera_pose_mode: {camera_pose_mode}")
+                    all_view_poses_raw = None
+                
+                if all_view_poses_raw is not None and len(all_view_poses_raw) > 0:
+                    # 解码每个视角的 pose
+                    all_view_poses_decoded = inference._pipeline._decode_all_view_poses(
+                        # 将 list 转换为 dict 格式
+                        {
+                            key: torch.stack([pose[key] for pose in all_view_poses_raw])
+                            for key in all_view_poses_raw[0].keys()
+                        },
+                        view_ss_input_dicts,
+                    )
+                    
+                    # 计算平均 scale
+                    scales = [np.array(pose['scale']).flatten()[:3] for pose in all_view_poses_decoded]
+                    avg_scale = np.mean(scales, axis=0)
+                    scale_std = np.std(scales, axis=0)
+                    logger.info(f"[Camera Pose] Average scale across views: {avg_scale}")
+                    logger.info(f"[Camera Pose] Scale std: {scale_std}")
+                    logger.info(f"[Camera Pose] Scale consistency: {'Good' if scale_std.max() < 0.1 else 'Poor'}")
+                    
+                    # 计算相机位姿
+                    camera_poses = compute_camera_poses_from_object_poses(all_view_poses_decoded)
+                    
+                    # 保存结果
+                    result['refined_poses'] = all_view_poses_decoded
+                    result['camera_poses'] = camera_poses
+                    result['avg_scale'] = avg_scale
+                    result['camera_pose_mode'] = camera_pose_mode
     
     # Save results
     saved_files = []
@@ -1154,49 +1612,153 @@ def run_weighted_inference(
         saved_files.append("params.npz")
         print(f"✓ Parameters saved to: {params_path}")
     
-    # 保存原始 pose（解码前）用于调试
-    if 'all_view_poses_raw' in result:
-        raw_poses = result['all_view_poses_raw']
-        raw_poses_npz = {}
-        for key, tensor in raw_poses.items():
-            if torch.is_tensor(tensor):
-                raw_poses_npz[key] = tensor.cpu().numpy()
-            else:
-                raw_poses_npz[key] = np.array(tensor)
-        raw_poses_path = output_dir / "all_view_poses_raw.npz"
-        np.savez(raw_poses_path, **raw_poses_npz)
-        logger.info(f"Raw poses saved to: {raw_poses_path}")
+    # 保存相机位姿估计结果（仅在 estimate_camera_pose 模式下）
+    if 'camera_poses' in result and 'refined_poses' in result:
+        import json
         
-        # 比较 View 0 的原始 pose 和 ss_return_dict 中的 pose
-        logger.info("=" * 60)
-        logger.info("Comparing View 0 raw pose vs final output (before decoding):")
-        logger.info("=" * 60)
-        for key in ['scale', 'translation', '6drotation', '6drotation_normalized', 'translation_scale']:
-            if key in raw_poses:
-                raw_v0 = raw_poses[key][0] if len(raw_poses[key].shape) > 1 else raw_poses[key]
-                if torch.is_tensor(raw_v0):
-                    raw_v0 = raw_v0.cpu().numpy()
-                final_v = result.get(key, None)
-                if final_v is not None:
-                    if torch.is_tensor(final_v):
-                        final_v = final_v.cpu().numpy()
-                    logger.info(f"  {key}:")
-                    logger.info(f"    View 0 raw:  {raw_v0.flatten()[:6]}")
-                    logger.info(f"    Final (V0):  {final_v.flatten()[:6]}")
-                    if np.allclose(raw_v0.flatten(), final_v.flatten(), atol=1e-5):
-                        logger.info(f"    ✓ MATCH")
+        # 准备 JSON 数据
+        estimated_data = {
+            "num_views": len(result['refined_poses']),
+            "mode": result.get('camera_pose_mode', 'unknown'),
+            "avg_scale": result['avg_scale'].tolist() if isinstance(result['avg_scale'], np.ndarray) else result['avg_scale'],
+            "object_poses": [],
+            "camera_poses": [],
+        }
+        
+        for pose in result['refined_poses']:
+            pose_data = {}
+            for key, value in pose.items():
+                if isinstance(value, np.ndarray):
+                    pose_data[key] = value.tolist()
+                else:
+                    pose_data[key] = value
+            estimated_data["object_poses"].append(pose_data)
+        
+        for cam_pose in result['camera_poses']:
+            cam_data = {
+                "view_idx": cam_pose['view_idx'],
+                "camera_position": cam_pose['camera_position'].tolist(),
+                "R_c2w": cam_pose['R_c2w'].tolist(),
+                "t_c2w": cam_pose['t_c2w'].tolist(),
+                "c2w": cam_pose['c2w'].tolist(),
+                "w2c": cam_pose['w2c'].tolist(),
+            }
+            estimated_data["camera_poses"].append(cam_data)
+        
+        # 保存 JSON
+        estimated_path = output_dir / "estimated_poses.json"
+        with open(estimated_path, 'w') as f:
+            json.dump(estimated_data, f, indent=2)
+        saved_files.append("estimated_poses.json")
+        print(f"✓ Estimated poses saved to: {estimated_path}")
+        
+        # 创建物体+相机可视化
+        if glb_path is not None and glb_path.exists():
+            # 使用 View 0 的 pose 作为物体在世界坐标系中的 pose
+            object_pose = result['refined_poses'][0]
+            
+            # 根据物体大小自动调整相机锥体尺寸
+            avg_scale = result['avg_scale']
+            if isinstance(avg_scale, np.ndarray):
+                obj_size = avg_scale.mean()
+            else:
+                obj_size = np.mean(avg_scale)
+            camera_scale = max(0.05, obj_size * 0.3)  # 相机锥体大小约为物体的 30%
+            logger.info(f"[Viz] Object size: {obj_size:.4f}, camera scale: {camera_scale:.4f}")
+            
+            viz_path = visualize_object_with_cameras(
+                sam3d_glb_path=glb_path,
+                object_pose=object_pose,
+                camera_poses=result['camera_poses'],
+                output_path=output_dir / "result_with_cameras.glb",
+                camera_scale=camera_scale,
+            )
+            if viz_path:
+                saved_files.append("result_with_cameras.glb")
+                print(f"✓ Object with cameras visualization saved to: {viz_path}")
+        
+        # 多视角 overlay：当 estimate_camera_pose=True 且 camera_pose_mode=independent 时
+        # 为每个视角生成 overlay，使用统一的 shape 和该视角的 pose
+        if result.get('camera_pose_mode') == 'independent' and glb_path is not None and glb_path.exists():
+            logger.info("=" * 60)
+            logger.info("Generating per-view overlays (independent mode)")
+            logger.info("=" * 60)
+            
+            refined_poses = result['refined_poses']
+            num_views = len(refined_poses)
+            
+            # 获取每个视角的 pointmap
+            raw_view_pointmaps = result.get('raw_view_pointmaps', [])
+            view_ss_input_dicts = result.get('view_ss_input_dicts', [])
+            
+            if len(raw_view_pointmaps) < num_views and len(view_ss_input_dicts) < num_views:
+                logger.warning(f"Not enough pointmaps for all views: "
+                              f"raw_view_pointmaps={len(raw_view_pointmaps)}, "
+                              f"view_ss_input_dicts={len(view_ss_input_dicts)}, "
+                              f"num_views={num_views}")
+            else:
+                for view_idx in range(num_views):
+                    # 获取该视角的 pose
+                    view_pose = refined_poses[view_idx]
+                    sam3d_pose = {}
+                    for key in ['scale', 'rotation', 'translation']:
+                        if key in view_pose:
+                            value = view_pose[key]
+                            if isinstance(value, np.ndarray):
+                                sam3d_pose[key] = value.flatten()
+                            else:
+                                sam3d_pose[key] = np.array(value).flatten()
+                    
+                    # 获取该视角的 pointmap
+                    pointmap_data = None
+                    pm_scale_np = None
+                    pm_shift_np = None
+                    
+                    if view_idx < len(raw_view_pointmaps) and raw_view_pointmaps[view_idx] is not None:
+                        # raw_view_pointmaps 格式: (H, W, 3)，需要转换为 (3, H, W)
+                        pointmap_data = raw_view_pointmaps[view_idx]
+                        if pointmap_data.ndim == 3 and pointmap_data.shape[-1] == 3:
+                            pointmap_data = pointmap_data.transpose(2, 0, 1)  # HWC -> CHW
+                        logger.info(f"[Overlay View {view_idx}] Using raw_view_pointmaps (metric)")
+                    elif view_idx < len(view_ss_input_dicts):
+                        internal_pm = view_ss_input_dicts[view_idx].get('pointmap')
+                        if internal_pm is not None:
+                            pointmap_data = internal_pm
+                            logger.info(f"[Overlay View {view_idx}] Using normalized pointmap from view_ss_input_dicts")
+                        pm_scale = view_ss_input_dicts[view_idx].get('pointmap_scale')
+                        pm_shift = view_ss_input_dicts[view_idx].get('pointmap_shift')
+                        if pm_scale is not None:
+                            pm_scale_np = pm_scale.detach().cpu().numpy() if torch.is_tensor(pm_scale) else np.array(pm_scale)
+                        if pm_shift is not None:
+                            pm_shift_np = pm_shift.detach().cpu().numpy() if torch.is_tensor(pm_shift) else np.array(pm_shift)
+                    
+                    if pointmap_data is not None:
+                        # 获取该视角的图像（用于点云上色）
+                        view_image = view_images[view_idx] if view_images and view_idx < len(view_images) else None
+                        
+                        overlay_path = overlay_sam3d_on_pointmap(
+                            glb_path,
+                            pointmap_data,
+                            sam3d_pose,
+                            input_image=view_image,
+                            output_path=output_dir / f"result_overlay_view{view_idx}.glb",
+                            pointmap_scale=pm_scale_np,
+                            pointmap_shift=pm_shift_np,
+                        )
+                        if overlay_path:
+                            saved_files.append(f"result_overlay_view{view_idx}.glb")
+                            print(f"✓ Overlay (View {view_idx}) saved to: {overlay_path}")
                     else:
-                        logger.info(f"    ✗ MISMATCH! diff={np.abs(raw_v0.flatten() - final_v.flatten())[:6]}")
+                        logger.warning(f"[Overlay View {view_idx}] No pointmap available, skipping")
     
-    # 保存所有视角的解码后 pose（如果有的话）
+    # 保存所有视角的解码后 pose（仅在 optimize_per_view_pose 模式下）
     if 'all_view_poses_decoded' in result:
         all_poses_decoded = result['all_view_poses_decoded']
         import json
         
-        # 保存为 JSON 格式（方便查看）
+        # 保存为 JSON 格式
         all_poses_json = {
             "num_views": len(all_poses_decoded),
-            "note": "Each view decoded with its OWN pointmap_scale/shift. If predictions are correct, metric poses should be consistent.",
             "views": []
         }
         for view_idx, pose in enumerate(all_poses_decoded):
@@ -1214,41 +1776,8 @@ def run_weighted_inference(
         saved_files.append("all_view_poses_decoded.json")
         print(f"✓ All view poses (decoded) saved to: {all_poses_path}")
         
-        # 也保存为 npz 格式（方便程序读取）
-        all_poses_npz = {}
-        for view_idx, pose in enumerate(all_poses_decoded):
-            for key, value in pose.items():
-                npz_key = f"view{view_idx}_{key}"
-                if isinstance(value, np.ndarray):
-                    all_poses_npz[npz_key] = value
-                elif isinstance(value, (list, tuple)):
-                    all_poses_npz[npz_key] = np.array(value)
-        all_poses_npz["num_views"] = len(all_poses_decoded)
-        all_poses_npz_path = output_dir / "all_view_poses_decoded.npz"
-        np.savez(all_poses_npz_path, **all_poses_npz)
-        
-        # 打印每个视角的解码后 pose
-        logger.info("=" * 60)
-        logger.info("All view poses (DECODED, each with its own pointmap_scale):")
-        logger.info("=" * 60)
-        for view_idx, pose in enumerate(all_poses_decoded):
-            logger.info(f"  View {view_idx}:")
-            if 'translation' in pose:
-                t = pose['translation']
-                logger.info(f"    translation: {t.flatten()[:3] if isinstance(t, np.ndarray) else t}")
-            if 'rotation' in pose:
-                r = pose['rotation']
-                logger.info(f"    rotation (wxyz): {r.flatten()[:4] if isinstance(r, np.ndarray) else r}")
-            if 'scale' in pose:
-                s = pose['scale']
-                logger.info(f"    scale: {s.flatten()[:3] if isinstance(s, np.ndarray) else s}")
-            if 'pointmap_scale' in pose:
-                ps = pose['pointmap_scale']
-                logger.info(f"    pointmap_scale: {ps.flatten()[:3] if isinstance(ps, np.ndarray) else ps}")
-        logger.info("=" * 60)
-        
-        # 创建多视角 pose 一致性可视化
-        if da3_extrinsics is not None and glb_path.exists() and merge_da3_glb:
+        # 创建多视角 pose 一致性可视化（需要 DA3 extrinsics）
+        if da3_extrinsics is not None and glb_path.exists():
             try:
                 multiview_glb_path = visualize_multiview_pose_consistency(
                     sam3d_glb_path=glb_path,
@@ -1262,25 +1791,6 @@ def run_weighted_inference(
                     print(f"✓ Multi-view pose consistency visualization saved to: {multiview_glb_path}")
             except Exception as e:
                 logger.warning(f"Failed to create multiview visualization: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # Print the pose values for reference
-        logger.info("Pose parameters (canonical -> camera/metric space):")
-        if 'translation' in params:
-            logger.info(f"  Translation: {params['translation']}")
-        if 'rotation' in params:
-            logger.info(f"  Rotation (quaternion): {params['rotation']}")
-        if 'scale' in params:
-            logger.info(f"  Scale (in normalized space): {params['scale']}")
-        if 'pointmap_scale' in params:
-            logger.info(f"  Pointmap scale (normalization factor): {params['pointmap_scale']}")
-        if 'pointmap_shift' in params:
-            logger.info(f"  Pointmap shift: {params['pointmap_shift']}")
-        if 'downsample_factor' in params:
-            logger.info(f"  Downsample factor: {params['downsample_factor']}")
-        if 'coords' in params:
-            logger.info(f"  Coords shape: {params['coords'].shape}")
     
     print(f"\n{'='*60}")
     print(f"All output files saved to: {output_dir}")
@@ -1618,6 +2128,27 @@ Examples:
                         help="Overlay SAM3D result on input pointmap for pose visualization. "
                              "Works with both MoGe (default) and DA3 (if --da3_output is provided)")
     
+    # Per-view pose optimization - 每个视角独立优化 pose
+    parser.add_argument("--optimize_per_view_pose", action="store_true",
+                        help="Optimize pose independently for each view. "
+                             "When enabled, each view maintains and iterates its own pose. "
+                             "Requires --da3_output for camera extrinsics to visualize multi-view consistency. "
+                             "Outputs: all_view_poses_decoded.json, multiview_pose_consistency.glb")
+    
+    # Camera pose estimation - 估计相机位姿
+    parser.add_argument("--estimate_camera_pose", action="store_true",
+                        help="Estimate camera poses from object poses. "
+                             "Stage 2: Fix shape, refine pose for each view independently. "
+                             "Then compute relative camera poses assuming the object is static. "
+                             "Outputs: estimated_poses.json, result_with_cameras.glb")
+    parser.add_argument("--pose_refine_steps", type=int, default=50,
+                        help="Number of steps for pose refinement in Stage 2 (default: 50)")
+    parser.add_argument("--camera_pose_mode", type=str, default="fixed_shape",
+                        choices=["fixed_shape", "independent"],
+                        help="Mode for camera pose estimation: "
+                             "'fixed_shape' (default): Fix multi-view fused shape, only refine pose. "
+                             "'independent': Each view optimizes shape+pose independently from noise.")
+    
     args = parser.parse_args()
     
     input_path = Path(args.input_path)
@@ -1649,6 +2180,10 @@ Examples:
             da3_output_path=args.da3_output,
             merge_da3_glb=args.merge_da3_glb,
             overlay_pointmap=args.overlay_pointmap,
+            optimize_per_view_pose=args.optimize_per_view_pose,
+            estimate_camera_pose=args.estimate_camera_pose,
+            pose_refine_steps=args.pose_refine_steps,
+            camera_pose_mode=args.camera_pose_mode,
         )
     except Exception as e:
         logger.error(f"Inference failed: {e}")
