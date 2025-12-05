@@ -160,7 +160,18 @@ def run_da3_inference(
     image_files = []
     for ext in image_extensions:
         image_files.extend(image_dir.glob(ext))
-    image_files = sorted(image_files)
+    
+    # Sort with natural number ordering (consistent with inference code)
+    # This ensures "2.jpg" comes before "10.jpg" for numeric filenames
+    def natural_sort_key(path):
+        """Sort key that handles numeric filenames correctly."""
+        stem = path.stem
+        try:
+            return (0, int(stem), stem)  # Numeric names first, sorted numerically
+        except ValueError:
+            return (1, 0, stem)  # Non-numeric names after, sorted alphabetically
+    
+    image_files = sorted(image_files, key=natural_sort_key)
     
     if len(image_files) == 0:
         raise ValueError(f"No images found in {image_dir}")

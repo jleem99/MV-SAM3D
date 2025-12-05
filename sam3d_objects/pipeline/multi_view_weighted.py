@@ -20,7 +20,6 @@ from loguru import logger
 from sam3d_objects.utils.latent_weighting import (
     LatentWeightManager,
     WeightingConfig,
-    compute_patch_entropy,
 )
 
 
@@ -163,6 +162,391 @@ class AttentionCollector:
         self._downsample_idx = None
         self._original_coords = None
         self._downsampled_coords = None
+
+
+# ============================================================================
+# SS (Stage 1) Attention Collector - for Dense Latent (4096 voxels)
+# ============================================================================
+
+class SSAttentionCollector:
+    """
+    Collects attention weights during SS (Stage 1) warmup pass for weight computation.
+    
+    Unlike SLAT, SS uses dense latent (4096 voxels), so no downsample mapping is needed.
+    This collector specifically targets the 'shape' latent in MM-DiT architecture.
+    
+    Strategy: Keep the LAST step's attention (closer to t=1, more stable patterns).
+    For each step, we collect cond branch attention and overwrite previous step's data.
+    
+    Attention format: [bs, 4096, num_cond_tokens]
+    """
+    
+    def __init__(self, num_views: int, target_layer: int = 9):
+        self.num_views = num_views
+        self.target_layer = target_layer
+        self._attentions: Dict[int, torch.Tensor] = {}
+        self._current_view: int = 0
+        self._current_step: int = 0
+        # Track which views have been collected in THIS step (to skip uncond branch)
+        self._step_collected_views: set = set()
+    
+    def set_view(self, view_idx: int):
+        """Set current view being processed."""
+        self._current_view = view_idx
+    
+    def new_step(self):
+        """Called at the start of each new step to reset per-step tracking."""
+        self._current_step += 1
+        self._step_collected_views.clear()
+    
+    def collect(self, layer_idx: int, attention: torch.Tensor):
+        """
+        Collect attention for the current view.
+        
+        Only collects cond branch (first call for each view in each step).
+        Overwrites previous step's attention to keep only the latest.
+        
+        Args:
+            layer_idx: Layer index
+            attention: [B, 4096, L_cond] attention weights
+        """
+        if layer_idx != self.target_layer:
+            return
+        
+        # Skip if already collected for this view in THIS step (this is the uncond branch)
+        if self._current_view in self._step_collected_views:
+            return
+        
+        # Store attention (cond branch), overwriting previous step's data
+        self._attentions[self._current_view] = attention.detach().cpu().clone()
+        self._step_collected_views.add(self._current_view)
+        logger.debug(f"[SSAttentionCollector] Step {self._current_step}: Collected attention for view {self._current_view}")
+    
+    def get_attentions(self) -> Dict[int, torch.Tensor]:
+        """Get all collected attentions."""
+        return self._attentions
+    
+    def reset(self):
+        """Reset collected data."""
+        self._attentions.clear()
+        self._step_collected_views.clear()
+        self._current_step = 0
+
+
+def compute_ss_entropy_weights(
+    attentions: Dict[int, torch.Tensor],
+    alpha: float = 60.0,
+    min_weight: float = 0.001,
+    patch_start: int = 1,
+    patch_end: int = 1370,
+) -> torch.Tensor:
+    """
+    Compute weights for SS (Stage 1) from attention entropy.
+    
+    SS stage condition layout (7528 tokens total):
+    - image_cropped: [0, 1370) with CLS at 0, patches at [1, 1370)
+    - mask_cropped: [1370, 2740)
+    - image_full: [2740, 4110)
+    - mask_full: [4110, 5480)
+    - pointmap: [5480, 6504)
+    - rgb_pointmap: [6504, 7528)
+    
+    By default, uses image_cropped patch tokens (positions 1-1370, excluding CLS at 0).
+    
+    Args:
+        attentions: Dict mapping view_idx to attention tensor [bs, 4096, num_cond_tokens]
+        alpha: Gibbs temperature for softmax (higher = more contrast)
+        min_weight: Minimum weight to prevent complete zeroing
+        patch_start: Start index of patch tokens (default: 1, after CLS)
+        patch_end: End index of patch tokens (default: 1370)
+    
+    Returns:
+        weights: [num_views, 4096] tensor of weights, normalized to sum to 1 across views
+    """
+    views = sorted(attentions.keys())
+    num_views = len(views)
+    
+    if num_views == 0:
+        return None
+    if num_views == 1:
+        # Single view: uniform weight
+        return torch.ones(1, attentions[views[0]].shape[1])
+    
+    # Compute patch entropy for each view
+    entropies = []
+    for v in views:
+        attn = attentions[v]  # [bs, 4096, num_cond_tokens]
+        
+        # Extract patch tokens (skip CLS, use patch tokens)
+        actual_end = min(patch_end, attn.shape[-1])
+        patch_attn = attn[:, :, patch_start:actual_end]  # [bs, 4096, num_patches]
+        
+        # Normalize attention to sum to 1 over patches
+        patch_sum = patch_attn.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+        patch_attn_norm = patch_attn / patch_sum
+        
+        # Compute entropy: H = -sum(p * log(p))
+        log_attn = torch.log(patch_attn_norm + 1e-10)
+        entropy = -(patch_attn_norm * log_attn).sum(dim=-1)  # [bs, 4096]
+        
+        # Average over batch dimension
+        entropy = entropy.mean(dim=0)  # [4096]
+        
+        # Normalize by max entropy (optional, for consistency)
+        num_patches = patch_attn.shape[-1]
+        max_entropy = math.log(num_patches)
+        entropy = entropy / max_entropy
+        
+        entropies.append(entropy)
+        logger.info(f"[SS Entropy] View {v}: entropy mean={entropy.mean():.4f}, std={entropy.std():.4f}, min={entropy.min():.4f}, max={entropy.max():.4f}")
+    
+    # Stack: [num_views, 4096]
+    entropy_stack = torch.stack(entropies, dim=0)
+    
+    # Log cross-view entropy statistics
+    entropy_mean_per_view = entropy_stack.mean(dim=1)  # [num_views]
+    entropy_std_across_views = entropy_stack.std(dim=0).mean()  # scalar
+    logger.info(f"[SS Entropy] Cross-view statistics:")
+    logger.info(f"  Per-view mean entropy: {entropy_mean_per_view.tolist()}")
+    logger.info(f"  Cross-view std (avg over latents): {entropy_std_across_views:.4f}")
+    
+    # Compute weights: softmax(-alpha * entropy)
+    # Lower entropy = higher weight
+    logits = -alpha * entropy_stack
+    logger.info(f"[SS Weights] Logits range: min={logits.min():.2f}, max={logits.max():.2f}, spread={logits.max()-logits.min():.2f}")
+    
+    weights = torch.softmax(logits, dim=0)  # [num_views, 4096]
+    
+    # Apply min weight
+    if min_weight > 0:
+        weights = weights.clamp(min=min_weight)
+        weights = weights / weights.sum(dim=0, keepdim=True)
+    
+    # Log per-view mean weights
+    logger.info(f"[SS Weights] Computed weights: shape={weights.shape}, "
+                f"mean per view: {[f'{weights[i].mean():.4f}' for i in range(num_views)]}")
+    
+    # Log per-latent best view distribution (which view wins most often)
+    best_views = weights.argmax(dim=0)  # [4096]
+    view_counts = [(best_views == v).sum().item() for v in range(num_views)]
+    logger.info(f"[SS Weights] Best view distribution (per latent): {view_counts}")
+    
+    # Log weight extremes (how polarized are the weights?)
+    max_weights = weights.max(dim=0)[0]  # [4096]
+    logger.info(f"[SS Weights] Max weight per latent: mean={max_weights.mean():.4f}, min={max_weights.min():.4f}, max={max_weights.max():.4f}")
+    
+    return weights
+
+
+@contextmanager
+def inject_ss_generator_with_collector(
+    generator,
+    num_views: int,
+    num_steps: int,
+    attention_collector: SSAttentionCollector,
+    attention_logger=None,
+):
+    """
+    Inject multi-view support with attention collection for SS (Stage 1).
+    
+    This is similar to inject_generator_multi_view_with_collector but for SS generator
+    which uses MM-DiT architecture and dense latent (4096 voxels).
+    
+    Args:
+        generator: SS generator (ss_generator)
+        num_views: Number of views
+        num_steps: Number of inference steps
+        attention_collector: SSAttentionCollector instance
+        attention_logger: Optional CrossAttentionLogger for saving attention to files
+    
+    Yields:
+        None
+    """
+    from sam3d_objects.model.backbone.tdfy_dit.modules.attention import MultiHeadAttention
+    
+    original_dynamics = generator._generate_dynamics
+    
+    # Hook into cross-attention to collect attention
+    hooks = []
+    cfg_wrapper = getattr(generator, "reverse_fn", None)
+    backbone = getattr(cfg_wrapper, "backbone", None)
+    
+    if backbone is not None:
+        blocks = getattr(backbone, "blocks", None)
+        if blocks is not None:
+            for idx, block in enumerate(blocks):
+                if idx != attention_collector.target_layer:
+                    continue
+                cross_attn = getattr(block, "cross_attn", None)
+                if cross_attn is None:
+                    continue
+                
+                # MM-DiT: cross_attn is a ModuleDict, we only care about 'shape'
+                import torch.nn as nn
+                if isinstance(cross_attn, nn.ModuleDict):
+                    shape_attn = cross_attn["shape"] if "shape" in cross_attn else None
+                    if shape_attn is not None and isinstance(shape_attn, MultiHeadAttention):
+                        def make_hook(layer_idx):
+                            def hook(module, inputs, outputs):
+                                if len(inputs) < 2:
+                                    return
+                                query, context = inputs[0], inputs[1]
+                                
+                                # Compute attention weights
+                                with torch.no_grad():
+                                    attn = _compute_ss_attention_weights(module, query, context)
+                                    if attn is not None:
+                                        attention_collector.collect(layer_idx, attn)
+                            return hook
+                        
+                        handle = shape_attn.register_forward_hook(make_hook(idx))
+                        hooks.append(handle)
+                        logger.info(f"[SSAttentionCollector] Hooked layer {idx} for shape attention collection")
+                else:
+                    # Non-MM-DiT fallback
+                    if isinstance(cross_attn, MultiHeadAttention):
+                        def make_hook(layer_idx):
+                            def hook(module, inputs, outputs):
+                                if len(inputs) < 2:
+                                    return
+                                query, context = inputs[0], inputs[1]
+                                with torch.no_grad():
+                                    attn = _compute_ss_attention_weights(module, query, context)
+                                    if attn is not None:
+                                        attention_collector.collect(layer_idx, attn)
+                            return hook
+                        
+                        handle = cross_attn.register_forward_hook(make_hook(idx))
+                        hooks.append(handle)
+                        logger.info(f"[SSAttentionCollector] Hooked layer {idx} for attention collection")
+    
+    # Import POSE_KEYS from multi_view_utils
+    from sam3d_objects.pipeline.multi_view_utils import POSE_KEYS
+    
+    def _new_dynamics_with_collection(x_t, t, *args_conditionals, **kwargs_conditionals):
+        """Multidiffusion with attention collection for SS."""
+        # Mark new step for attention collector (so it keeps only the last step's attention)
+        attention_collector.new_step()
+        
+        cond_idx = 0
+        if len(args_conditionals) > 0:
+            if isinstance(args_conditionals[0], (int, float)) or (
+                isinstance(args_conditionals[0], torch.Tensor) and args_conditionals[0].numel() == 1
+            ):
+                cond_idx = 1
+        
+        if len(args_conditionals) > cond_idx:
+            cond_tokens = args_conditionals[cond_idx]
+            
+            # Parse view conditions
+            if isinstance(cond_tokens, (list, tuple)):
+                view_conditions = cond_tokens
+            elif isinstance(cond_tokens, torch.Tensor) and cond_tokens.shape[0] == num_views:
+                view_conditions = [cond_tokens[i] for i in range(num_views)]
+            else:
+                view_conditions = [cond_tokens] * num_views
+            
+            # Collect predictions from all views
+            preds = []
+            for view_idx in range(num_views):
+                view_cond = view_conditions[view_idx]
+                if cond_idx < len(args_conditionals):
+                    new_args = args_conditionals[:cond_idx] + (view_cond,) + args_conditionals[cond_idx+1:]
+                else:
+                    new_args = args_conditionals + (view_cond,)
+                
+                # Set current view for attention collection
+                attention_collector.set_view(view_idx)
+                
+                if attention_logger is not None:
+                    attention_logger.set_view(view_idx)
+                
+                pred = original_dynamics(x_t, t, *new_args, **kwargs_conditionals)
+                preds.append(pred)
+            
+            # Simple average for warmup pass (with POSE_KEYS handling)
+            if isinstance(preds[0], dict):
+                fused_pred = {}
+                for key in preds[0].keys():
+                    stacked = torch.stack([p[key] for p in preds])
+                    if key in POSE_KEYS:
+                        fused_pred[key] = preds[0][key]
+                    else:
+                        fused_pred[key] = stacked.mean(dim=0)
+                return fused_pred
+            elif isinstance(preds[0], (list, tuple)):
+                fused_pred = tuple(
+                    torch.stack([p[i] for p in preds]).mean(dim=0)
+                    for i in range(len(preds[0]))
+                )
+                return fused_pred
+            else:
+                return torch.stack(preds).mean(dim=0)
+        else:
+            return original_dynamics(x_t, t, *args_conditionals, **kwargs_conditionals)
+    
+    generator._generate_dynamics = _new_dynamics_with_collection
+    
+    try:
+        yield
+    finally:
+        generator._generate_dynamics = original_dynamics
+        # Remove hooks
+        for handle in hooks:
+            handle.remove()
+
+
+def _compute_ss_attention_weights(module, query, context):
+    """
+    Compute attention weights for SS (Stage 1).
+    
+    Args:
+        module: MultiHeadAttention module
+        query: Query tensor [B, L_latent, C]
+        context: Context tensor [B, L_cond, C]
+    
+    Returns:
+        attention: [B, L_latent, L_cond] attention weights
+    """
+    if query is None or context is None:
+        return None
+    
+    # For dense tensor
+    if not torch.is_tensor(query) or not torch.is_tensor(context):
+        return None
+    
+    try:
+        B, L_q, C = query.shape
+        _, L_c, _ = context.shape
+        
+        # Get head dim and num_heads
+        head_dim = module.head_dim if hasattr(module, 'head_dim') else C // module.num_heads
+        num_heads = module.num_heads
+        
+        # Project to Q
+        q = module.to_q(query)  # [B, L_q, C]
+        
+        # Project to K, V (they are combined in to_kv)
+        # to_kv outputs [B, L_c, C * 2] which contains both K and V
+        kv = module.to_kv(context)  # [B, L_c, C * 2]
+        k, v = kv.chunk(2, dim=-1)  # Each is [B, L_c, C]
+        
+        # Reshape for multi-head
+        q = q.view(B, L_q, num_heads, head_dim).transpose(1, 2)  # [B, H, L_q, D]
+        k = k.view(B, L_c, num_heads, head_dim).transpose(1, 2)  # [B, H, L_c, D]
+        
+        # Compute attention scores
+        scale = head_dim ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, H, L_q, L_c]
+        attn = torch.softmax(attn, dim=-1)
+        
+        # Average over heads
+        attn = attn.mean(dim=1)  # [B, L_q, L_c]
+        
+        return attn
+    except Exception as e:
+        logger.warning(f"[SS Attention] Failed to compute: {e}")
+        return None
 
 
 @contextmanager

@@ -73,8 +73,22 @@ def load_images_and_masks(
         raise ValueError(f"Path is not a directory: {images_and_masks_dir}")
     
     if image_names is None:
-        image_files = sorted(images_and_masks_dir.glob("*.png")) + sorted(images_and_masks_dir.glob("*.jpg"))
+        # Collect all image files (both .png and .jpg)
+        image_files = list(images_and_masks_dir.glob("*.png")) + list(images_and_masks_dir.glob("*.jpg"))
         image_files = [f for f in image_files if "_mask" not in f.name]
+        
+        # Sort by filename with natural number ordering
+        # This ensures "9.png" comes after "8.jpg", not before "0.jpg"
+        def natural_sort_key(path):
+            """Sort key that handles numeric filenames correctly."""
+            stem = path.stem
+            # Try to extract leading number for sorting
+            try:
+                return (0, int(stem), stem)  # Numeric names first, sorted numerically
+            except ValueError:
+                return (1, 0, stem)  # Non-numeric names after, sorted alphabetically
+        
+        image_files = sorted(image_files, key=natural_sort_key)
         image_names = [f.stem for f in image_files]
         logger.info(f"Auto-detected {len(image_names)} images: {image_names}")
     
@@ -244,7 +258,20 @@ def load_images_and_masks_from_path(
         logger.info(f"Loading masks from: {masks_dir}")
         
         if image_names is None:
-            image_files = sorted(images_dir.glob("*.png")) + sorted(images_dir.glob("*.jpg"))
+            # Collect all image files (both .png and .jpg)
+            image_files = list(images_dir.glob("*.png")) + list(images_dir.glob("*.jpg"))
+            
+            # Sort by filename with natural number ordering
+            # This ensures "9.png" comes after "8.jpg", and "2.jpg" comes before "10.jpg"
+            def natural_sort_key(path):
+                """Sort key that handles numeric filenames correctly."""
+                stem = path.stem
+                try:
+                    return (0, int(stem), stem)  # Numeric names first, sorted numerically
+                except ValueError:
+                    return (1, 0, stem)  # Non-numeric names after, sorted alphabetically
+            
+            image_files = sorted(image_files, key=natural_sort_key)
             image_names = [f.stem for f in image_files]
             logger.info(f"Auto-detected {len(image_names)} images: {image_names}")
         

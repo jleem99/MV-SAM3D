@@ -14,24 +14,24 @@ Key features:
     - GLB merge visualization (SAM3D output + DA3 scene)
 
 Usage:
-    # Basic weighted inference (default: use entropy weighting)
+    # Basic weighted inference (both Stage 1 and Stage 2 weighted by default)
     python run_inference_weighted.py --input_path ./data --mask_prompt stuffed_toy --image_names 0,1,2,3
     
-    # Disable weighting (simple average, like original)
-    python run_inference_weighted.py --input_path ./data --mask_prompt stuffed_toy --image_names 0,1,2,3 --no_weighting
-    
-    # With visualization
-    python run_inference_weighted.py --input_path ./data --mask_prompt stuffed_toy --image_names 0,1,2,3 --visualize_weights
-    
-    # Custom weighting parameters
+    # Disable all weighting (simple average for both stages)
     python run_inference_weighted.py --input_path ./data --mask_prompt stuffed_toy --image_names 0,1,2,3 \
-        --entropy_alpha 3.0 --attention_layer 6 --attention_step 0
+        --no_stage1_weighting --no_stage2_weighting
     
-    # Use external pointmaps from DA3 (Depth Anything 3) and merge GLB for comparison
-    # First run: python scripts/run_da3.py --image_dir ./data/example/images --output_dir ./da3_outputs/example
-    # Then:
+    # Custom Stage 1 parameters
     python run_inference_weighted.py --input_path ./data --mask_prompt stuffed_toy --image_names 0,1,2,3 \
-        --da3_output ./da3_outputs/example/da3_output.npz --merge_da3_glb
+        --stage1_entropy_alpha 80.0 --stage1_entropy_layer 9
+    
+    # Custom Stage 2 parameters
+    python run_inference_weighted.py --input_path ./data --mask_prompt stuffed_toy --image_names 0,1,2,3 \
+        --stage2_entropy_alpha 80.0 --stage2_attention_layer 6
+    
+    # Use visibility weighting for Stage 2 (requires DA3)
+    python run_inference_weighted.py --input_path ./data --mask_prompt stuffed_toy --image_names 0,1,2,3 \
+        --da3_output ./da3_outputs/example/da3_output.npz --stage2_weight_source visibility
 """
 import sys
 import argparse
@@ -1875,49 +1875,79 @@ def get_output_dir(
     mask_prompt: Optional[str] = None, 
     image_names: Optional[List[str]] = None,
     is_single_view: bool = False,
-    use_weighting: bool = True,
-    entropy_alpha: float = 30.0,
+    # Stage 1 parameters
+    stage1_weighting: bool = True,
+    stage1_entropy_alpha: float = 30.0,
+    # Stage 2 parameters
+    stage2_weighting: bool = True,
+    stage2_weight_source: str = "entropy",
+    stage2_entropy_alpha: float = 30.0,
+    stage2_visibility_alpha: float = 30.0,
+    self_occlusion_tolerance: float = 4.0,
 ) -> Path:
-    """Create output directory based on input path and parameters."""
+    """
+    Create output directory based on input path and parameters.
+    
+    Directory structure:
+        visualization/{dataset_name}/{mask_prompt}/{detailed_name}/
+    
+    Example:
+        visualization/quike/box/quike_box_multiview_s1ea60_s2entropy_a60_20231205_123456/
+    """
     visualization_dir = Path("visualization")
-    visualization_dir.mkdir(exist_ok=True)
     
-    if mask_prompt:
-        dir_name = mask_prompt
-    else:
-        dir_name = input_path.name if input_path.is_dir() else input_path.parent.name
+    # Level 1: Dataset name (last component of input_path)
+    dataset_name = input_path.name if input_path.is_dir() else input_path.parent.name
     
-    # Add weighting suffix with alpha value
-    if use_weighting:
-        # Format alpha: remove trailing zeros, e.g., 5.0 -> "5", 5.5 -> "5.5"
-        alpha_str = f"{entropy_alpha:g}"
-        suffix = f"_weighted_a{alpha_str}"
-    else:
-        suffix = "_avg"
+    # Level 2: Mask prompt (or "default" if not specified)
+    mask_name = mask_prompt if mask_prompt else "default"
     
+    # Level 3: Detailed folder name
+    # Start with dataset_mask prefix
+    dir_name = f"{dataset_name}_{mask_name}"
+    
+    # Add view info
     if is_single_view:
         if image_names and len(image_names) == 1:
             safe_name = image_names[0].replace("/", "_").replace("\\", "_")
-            dir_name = f"{dir_name}_{safe_name}{suffix}"
+            dir_name = f"{dir_name}_{safe_name}"
         else:
-            dir_name = f"{dir_name}_single{suffix}"
+            dir_name = f"{dir_name}_single"
     elif image_names:
-        if len(image_names) == 1:
-            safe_name = image_names[0].replace("/", "_").replace("\\", "_")
-            dir_name = f"{dir_name}_{safe_name}{suffix}"
-        else:
-            safe_names = [name.replace("/", "_").replace("\\", "_") for name in image_names]
-            dir_name = f"{dir_name}_{'_'.join(safe_names[:3])}{suffix}"
-            if len(safe_names) > 3:
-                dir_name += f"_and_{len(safe_names)-3}_more"
+        num_views = len(image_names)
+        dir_name = f"{dir_name}_{num_views}v"
     else:
-        dir_name = f"{dir_name}_multiview{suffix}"
+        dir_name = f"{dir_name}_mv"
+    
+    # Add Stage 1 weighting parameters
+    if stage1_weighting:
+        s1_alpha_str = f"{stage1_entropy_alpha:g}"
+        dir_name = f"{dir_name}_s1a{s1_alpha_str}"
+    else:
+        dir_name = f"{dir_name}_s1off"
+    
+    # Add Stage 2 weighting parameters
+    if stage2_weighting:
+        if stage2_weight_source == "entropy":
+            s2_alpha_str = f"{stage2_entropy_alpha:g}"
+            dir_name = f"{dir_name}_s2e{s2_alpha_str}"
+        elif stage2_weight_source == "visibility":
+            s2_alpha_str = f"{stage2_visibility_alpha:g}"
+            tol_str = f"{self_occlusion_tolerance:g}"
+            dir_name = f"{dir_name}_s2v{s2_alpha_str}t{tol_str}"
+        elif stage2_weight_source == "mixed":
+            e_str = f"{stage2_entropy_alpha:g}"
+            v_str = f"{stage2_visibility_alpha:g}"
+            dir_name = f"{dir_name}_s2m_e{e_str}v{v_str}"
+    else:
+        dir_name = f"{dir_name}_s2off"
     
     # Add timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dir_name = f"{dir_name}_{timestamp}"
     
-    output_dir = visualization_dir / dir_name
+    # Create hierarchical directory structure
+    output_dir = visualization_dir / dataset_name / mask_name / dir_name
     output_dir.mkdir(parents=True, exist_ok=True)
     
     logger.info(f"Output directory: {output_dir}")
@@ -1933,58 +1963,68 @@ def run_weighted_inference(
     stage2_steps: int = 25,
     decode_formats: List[str] = None,
     model_tag: str = "hf",
-    # Weighting parameters
-    use_weighting: bool = True,
-    entropy_alpha: float = 30.0,
-    attention_layer: int = 6,
-    attention_step: int = 0,
-    min_weight: float = 0.01,
+    # Stage 1 (Shape) Weighting parameters
+    stage1_weighting: bool = True,
+    stage1_entropy_layer: int = 9,
+    stage1_entropy_alpha: float = 30.0,
+    # Stage 2 (Texture) Weighting parameters
+    stage2_weighting: bool = True,
+    stage2_weight_source: str = "entropy",  # "entropy", "visibility", "mixed"
+    stage2_entropy_alpha: float = 30.0,
+    stage2_visibility_alpha: float = 30.0,
+    stage2_attention_layer: int = 6,
+    stage2_attention_step: int = 0,
+    stage2_min_weight: float = 0.001,
+    stage2_weight_combine_mode: str = "average",  # "average" or "multiply"
+    stage2_visibility_weight_ratio: float = 0.5,  # Ratio for averaging in mixed mode
     # Visualization
     visualize_weights: bool = False,
     save_attention: bool = False,
     attention_layers_to_save: Optional[List[int]] = None,
     save_coords: bool = True,  # Default True for weighted inference
-    # Stage 2 init saving (for iteration stability analysis)
     save_stage2_init: bool = False,
-    # External pointmap (from DA3 etc.)
+    # DA3 integration
     da3_output_path: Optional[str] = None,
-    # GLB merge visualization
     merge_da3_glb: bool = False,
-    # Overlay visualization
     overlay_pointmap: bool = False,
-    # Latent visibility computation (uses self-occlusion / DDA ray tracing)
     enable_latent_visibility: bool = False,
-    self_occlusion_tolerance: float = 4.0,  # neighbor tolerance for visibility DDA
-    # Weight source selection
-    weight_source: str = "entropy",  # "entropy", "visibility", "mixed"
-    visibility_alpha: float = 30.0,  # Alpha for visibility weighting
-    weight_combine_mode: str = "average",  # "average" or "multiply"
-    visibility_weight_ratio: float = 0.5,  # Ratio for averaging in mixed mode
+    self_occlusion_tolerance: float = 4.0,
 ):
     """
-    Run weighted inference.
+    Run weighted inference with adaptive multi-view fusion.
+    
+    Two-stage weighting:
+    - Stage 1 (Shape): Uses entropy-based weighting for shape generation
+    - Stage 2 (Texture): Uses entropy/visibility/mixed weighting for texture generation
     
     Args:
-        input_path: Input path
+        input_path: Input data path
         mask_prompt: Mask folder name
-        image_names: List of image names
-        seed: Random seed
+        image_names: List of image names to use
+        seed: Random seed for reproducibility
         stage1_steps: Stage 1 inference steps
         stage2_steps: Stage 2 inference steps
-        decode_formats: List of decode formats
-        model_tag: Model tag
-        use_weighting: Whether to use entropy-based weighting (default True)
-        entropy_alpha: Gibbs temperature for entropy weighting
-        attention_layer: Which layer to use for weight computation
-        attention_step: Which step to use for weight computation
-        min_weight: Minimum weight to prevent complete zeroing
-        visualize_weights: Whether to save weight visualizations
-        save_attention: Whether to save attention weights
-        attention_layers_to_save: Which layers to save attention for
-        save_coords: Whether to save 3D coordinates
-        save_stage2_init: Whether to save Stage 2 initial latent for stability analysis
-        da3_output_path: Path to DA3 output npz file (from run_da3.py)
-            If provided, will use external pointmaps instead of internal depth model
+        decode_formats: Output formats (gaussian, mesh)
+        model_tag: Model checkpoint tag
+        
+        Stage 1 Weighting:
+            stage1_weighting: Enable Stage 1 entropy weighting (default: True)
+            stage1_entropy_layer: Attention layer for Stage 1 (default: 9)
+            stage1_entropy_alpha: Gibbs temperature for Stage 1 (default: 60.0)
+        
+        Stage 2 Weighting:
+            stage2_weighting: Enable Stage 2 weighting (default: True)
+            stage2_weight_source: "entropy", "visibility", or "mixed" (default: "entropy")
+            stage2_entropy_alpha: Gibbs temperature for entropy (default: 60.0)
+            stage2_visibility_alpha: Gibbs temperature for visibility (default: 60.0)
+            stage2_attention_layer: Attention layer for Stage 2 (default: 6)
+            stage2_attention_step: Diffusion step for attention (default: 0)
+            stage2_min_weight: Minimum weight (default: 0.001)
+        
+        DA3 Integration:
+            da3_output_path: Path to DA3 output (required for visibility weighting)
+            merge_da3_glb: Merge SAM3D output with DA3 scene
+            overlay_pointmap: Overlay SAM3D on View 0 pointmap
     """
     config_path = f"checkpoints/{model_tag}/pipeline.yaml"
     if not Path(config_path).exists():
@@ -2054,31 +2094,89 @@ def run_weighted_inference(
             da3_intrinsics = da3_data["intrinsics"]
             logger.info(f"  DA3 intrinsics shape: {da3_intrinsics.shape}")
         
-        # Check if number of pointmaps matches number of views
-        if da3_pointmaps.shape[0] < num_views:
-            raise ValueError(
-                f"DA3 pointmap count mismatch!\n"
-                f"  DA3 has {da3_pointmaps.shape[0]} pointmaps\n"
-                f"  But inference needs {num_views} views\n"
-                f"  DA3 output: {da3_path}\n"
-                f"Please ensure DA3 was run on the SAME images you're using for inference.\n"
-                f"Run: python scripts/run_da3.py --image_dir <correct_image_dir> --output_dir <output_dir>"
-            )
-        elif da3_pointmaps.shape[0] > num_views:
-            # If DA3 has more pointmaps, use first N (this is acceptable)
-            logger.warning(f"  DA3 has {da3_pointmaps.shape[0]} pointmaps but only {num_views} views, using first {num_views}")
-            view_pointmaps = [da3_pointmaps[i] for i in range(num_views)]
+        # Get inference image file names for matching
+        # Re-detect the image names using the same logic as load_images_and_masks
+        if mask_prompt:
+            images_dir = input_path / "images"
         else:
-            # Exact match
-            view_pointmaps = [da3_pointmaps[i] for i in range(num_views)]
+            images_dir = input_path
         
-        logger.info(f"  Successfully loaded {num_views} external pointmaps from DA3")
+        # Get inference image order (using natural sort)
+        def natural_sort_key(path):
+            stem = path.stem
+            try:
+                return (0, int(stem), stem)
+            except ValueError:
+                return (1, 0, stem)
+        
+        if image_names:
+            # User specified image names
+            inference_image_names = list(image_names)
+        else:
+            # Auto-detect
+            inf_image_files = list(images_dir.glob("*.png")) + list(images_dir.glob("*.jpg"))
+            inf_image_files = [f for f in inf_image_files if "_mask" not in f.name]
+            inf_image_files = sorted(inf_image_files, key=natural_sort_key)
+            inference_image_names = [f.stem for f in inf_image_files]
+        
+        logger.info(f"  Inference image order: {inference_image_names}")
+        
+        # Build DA3 filename -> index mapping
+        da3_file_mapping = {}
+        if "image_files" in da3_data:
+            da3_image_files = da3_data["image_files"]
+            for idx, filepath in enumerate(da3_image_files):
+                filename = Path(str(filepath)).stem  # Extract filename without extension
+                da3_file_mapping[filename] = idx
+            logger.info(f"  DA3 image order: {[Path(str(f)).stem for f in da3_image_files]}")
+        
+        # Match pointmaps by filename
+        view_pointmaps = []
+        matched_da3_extrinsics = []
+        matched_da3_intrinsics = []
+        
+        for inf_name in inference_image_names:
+            if inf_name in da3_file_mapping:
+                da3_idx = da3_file_mapping[inf_name]
+                view_pointmaps.append(da3_pointmaps[da3_idx])
+                if da3_extrinsics is not None:
+                    matched_da3_extrinsics.append(da3_extrinsics[da3_idx])
+                if da3_intrinsics is not None:
+                    matched_da3_intrinsics.append(da3_intrinsics[da3_idx])
+                logger.info(f"    Matched: inference '{inf_name}' -> DA3 index {da3_idx}")
+            else:
+                # Fallback: use index-based matching if filename not found
+                # This handles the case where DA3 doesn't have image_files or names don't match
+                fallback_idx = inference_image_names.index(inf_name)
+                if fallback_idx < da3_pointmaps.shape[0]:
+                    view_pointmaps.append(da3_pointmaps[fallback_idx])
+                    if da3_extrinsics is not None:
+                        matched_da3_extrinsics.append(da3_extrinsics[fallback_idx])
+                    if da3_intrinsics is not None:
+                        matched_da3_intrinsics.append(da3_intrinsics[fallback_idx])
+                    logger.warning(f"    Fallback: inference '{inf_name}' -> DA3 index {fallback_idx} (filename not found in DA3)")
+                else:
+                    raise ValueError(
+                        f"Cannot match pointmap for image '{inf_name}'!\n"
+                        f"  DA3 has {da3_pointmaps.shape[0]} pointmaps\n"
+                        f"  Inference needs {num_views} views\n"
+                        f"Please ensure DA3 was run on the SAME images."
+                    )
+        
+        # Update extrinsics and intrinsics to matched order
+        if matched_da3_extrinsics:
+            da3_extrinsics = np.array(matched_da3_extrinsics)
+        if matched_da3_intrinsics:
+            da3_intrinsics = np.array(matched_da3_intrinsics)
+        
+        logger.info(f"  Successfully loaded and matched {len(view_pointmaps)} external pointmaps from DA3")
     
     is_single_view = num_views == 1
     
     if is_single_view:
         logger.warning("Single view detected - weighting is not applicable, using standard inference")
-        use_weighting = False
+        stage1_weighting = False
+        stage2_weighting = False
     
     # Check parameter conflicts
     # 1. --merge_da3_glb requires --da3_output
@@ -2090,7 +2188,30 @@ def run_weighted_inference(
             "  Or remove --merge_da3_glb."
         )
     
-    output_dir = get_output_dir(input_path, mask_prompt, image_names, is_single_view, use_weighting, entropy_alpha)
+    # 2. visibility/mixed weight source requires --da3_output
+    if stage2_weight_source in ["visibility", "mixed"] and da3_output_path is None:
+        raise ValueError(
+            f"Parameter conflict: --stage2_weight_source {stage2_weight_source} requires --da3_output.\n"
+            "  Visibility weighting needs DA3's camera extrinsics.\n"
+            "  Please provide: --da3_output <path_to_da3_output.npz>\n"
+            "  Or use --stage2_weight_source entropy."
+        )
+    
+    output_dir = get_output_dir(
+        input_path=input_path, 
+        mask_prompt=mask_prompt, 
+        image_names=image_names, 
+        is_single_view=is_single_view,
+        # Stage 1 parameters
+        stage1_weighting=stage1_weighting,
+        stage1_entropy_alpha=stage1_entropy_alpha,
+        # Stage 2 parameters
+        stage2_weighting=stage2_weighting,
+        stage2_weight_source=stage2_weight_source,
+        stage2_entropy_alpha=stage2_entropy_alpha,
+        stage2_visibility_alpha=stage2_visibility_alpha,
+        self_occlusion_tolerance=self_occlusion_tolerance,
+    )
     
     # Setup logging
     log_file = output_dir / "inference.log"
@@ -2102,12 +2223,48 @@ def run_weighted_inference(
     
     decode_formats = decode_formats or ["gaussian", "mesh"]
     
+    # ========================================
+    # Print experiment configuration
+    # ========================================
+    logger.info("=" * 70)
+    logger.info("EXPERIMENT CONFIGURATION")
+    logger.info("=" * 70)
+    logger.info(f"Input: {input_path}")
+    logger.info(f"Mask prompt: {mask_prompt}")
+    logger.info(f"Number of views: {num_views}")
+    logger.info(f"Seed: {seed}")
+    logger.info("-" * 70)
+    logger.info("Stage 1 (Shape) Weighting:")
+    logger.info(f"  Enabled: {stage1_weighting}")
+    if stage1_weighting:
+        logger.info(f"  Entropy Layer: {stage1_entropy_layer}")
+        logger.info(f"  Entropy Alpha: {stage1_entropy_alpha}")
+    logger.info("-" * 70)
+    logger.info("Stage 2 (Texture) Weighting:")
+    logger.info(f"  Enabled: {stage2_weighting}")
+    if stage2_weighting:
+        logger.info(f"  Weight Source: {stage2_weight_source}")
+        logger.info(f"  Entropy Alpha: {stage2_entropy_alpha}")
+        logger.info(f"  Attention Layer: {stage2_attention_layer}")
+        logger.info(f"  Attention Step: {stage2_attention_step}")
+        if stage2_weight_source in ["visibility", "mixed"]:
+            logger.info(f"  Visibility Alpha: {stage2_visibility_alpha}")
+            logger.info(f"  Self-occlusion Tolerance: {self_occlusion_tolerance}")
+        if stage2_weight_source == "mixed":
+            logger.info(f"  Combine Mode: {stage2_weight_combine_mode}")
+            logger.info(f"  Visibility Weight Ratio: {stage2_visibility_weight_ratio}")
+    logger.info("-" * 70)
+    logger.info(f"DA3 Output: {da3_output_path}")
+    logger.info(f"Merge DA3 GLB: {merge_da3_glb}")
+    logger.info(f"Overlay Pointmap: {overlay_pointmap}")
+    logger.info("=" * 70)
+    
     # Create visibility callback if needed (uses self-occlusion / DDA ray tracing)
     visibility_callback = None
-    if weight_source in ["visibility", "mixed"]:
+    if stage2_weight_source in ["visibility", "mixed"] and stage2_weighting:
         if da3_extrinsics is None:
             raise ValueError(
-                f"weight_source='{weight_source}' requires DA3 output with camera extrinsics.\n"
+                f"stage2_weight_source='{stage2_weight_source}' requires DA3 output with camera extrinsics.\n"
                 f"Please provide --da3_output with valid extrinsics."
             )
         
@@ -2178,37 +2335,33 @@ def run_weighted_inference(
         )
         logger.info(f"Visibility callback created (self-occlusion based), tolerance={self_occlusion_tolerance}")
     
-    # Setup weighting config
+    # Setup weighting config for Stage 2
     weighting_config = WeightingConfig(
-        use_entropy=use_weighting,
-        entropy_alpha=entropy_alpha,
-        attention_layer=attention_layer,
-        attention_step=attention_step,
-        min_weight=min_weight,
+        use_entropy=stage2_weighting,
+        entropy_alpha=stage2_entropy_alpha,
+        attention_layer=stage2_attention_layer,
+        attention_step=stage2_attention_step,
+        min_weight=stage2_min_weight,
         # Visibility-related parameters
-        weight_source=weight_source,
-        visibility_alpha=visibility_alpha,
-        weight_combine_mode=weight_combine_mode,
-        visibility_weight_ratio=visibility_weight_ratio,
+        weight_source=stage2_weight_source,
+        visibility_alpha=stage2_visibility_alpha,
+        weight_combine_mode=stage2_weight_combine_mode,
+        visibility_weight_ratio=stage2_visibility_weight_ratio,
         visibility_callback=visibility_callback,
     )
-    
-    logger.info(f"Weighting config: use_weighting={use_weighting}, weight_source={weight_source}, "
-                f"entropy_alpha={entropy_alpha}, visibility_alpha={visibility_alpha}, "
-                f"layer={attention_layer}, step={attention_step}, min_weight={min_weight}")
     
     # Setup attention logger (only if explicitly requested for analysis)
     attention_logger: Optional[CrossAttentionLogger] = None
     if save_attention:
         # Only save attention when explicitly requested (for analysis purposes)
-        layers_to_hook = attention_layers_to_save or [attention_layer]
-        if attention_layer not in layers_to_hook:
-            layers_to_hook.append(attention_layer)
+        layers_to_hook = attention_layers_to_save or [stage2_attention_layer]
+        if stage2_attention_layer not in layers_to_hook:
+            layers_to_hook.append(stage2_attention_layer)
         
         attention_dir = output_dir / "attention"
         attention_logger = CrossAttentionLogger(
             attention_dir,
-            enabled_stages=["slat"],
+            enabled_stages=["ss", "slat"],  # Enable both Stage 1 (SS) and Stage 2 (SLAT)
             layer_indices=layers_to_hook,
             save_coords=save_coords,
         )
@@ -2238,7 +2391,9 @@ def run_weighted_inference(
         )
         weight_manager = None
     else:
-        logger.info(f"Multi-view inference mode ({'weighted' if use_weighting else 'average'})")
+        s1_mode = "weighted" if stage1_weighting else "average"
+        s2_mode = f"weighted ({stage2_weight_source})" if stage2_weighting else "average"
+        logger.info(f"Multi-view inference mode: Stage1={s1_mode}, Stage2={s2_mode}")
         if view_pointmaps is not None:
             logger.info(f"Using external pointmaps from DA3")
         result = inference._pipeline.run_multi_view(
@@ -2254,11 +2409,16 @@ def run_weighted_inference(
             with_texture_baking=False,
             use_vertex_color=True,
             attention_logger=attention_logger,
-            # Pass weighting config for weighted fusion
-            weighting_config=weighting_config if use_weighting else None,
+            # Pass weighting config for weighted fusion (Stage 2)
+            weighting_config=weighting_config if stage2_weighting else None,
             # Save Stage 2 init for stability analysis
             save_stage2_init=save_stage2_init,
             save_stage2_init_path=output_dir / "stage2_init.pt" if save_stage2_init else None,
+            # Stage 1 weighting parameters
+            ss_weighting=stage1_weighting,
+            ss_entropy_layer=stage1_entropy_layer,
+            ss_entropy_alpha=stage1_entropy_alpha,
+            ss_warmup_steps=1,  # Fixed at 1 for stability
         )
         weight_manager = result.get("weight_manager")
         
@@ -2409,7 +2569,9 @@ def run_weighted_inference(
     
     print(f"\n{'='*60}")
     print(f"Inference completed!")
-    print(f"Mode: {'Weighted' if use_weighting else 'Average'} fusion")
+    s1_str = "weighted" if stage1_weighting else "average"
+    s2_str = f"weighted ({stage2_weight_source})" if stage2_weighting else "average"
+    print(f"Mode: Stage1={s1_str}, Stage2={s2_str}")
     print(f"Generated coordinates: {result['coords'].shape[0] if 'coords' in result else 'N/A'}")
     print(f"{'='*60}")
     
@@ -2814,18 +2976,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic weighted inference
+  # Basic weighted inference (both stages weighted by default)
   python run_inference_weighted.py --input_path ./data --mask_prompt stuffed_toy --image_names 0,1,2,3
   
-  # Disable weighting (simple average)
-  python run_inference_weighted.py --input_path ./data --mask_prompt stuffed_toy --image_names 0,1,2,3 --no_weighting
-  
-  # With visualization
-  python run_inference_weighted.py --input_path ./data --mask_prompt stuffed_toy --image_names 0,1,2,3 --visualize_weights
-  
-  # Custom parameters
+  # Disable all weighting (simple average for both stages)
   python run_inference_weighted.py --input_path ./data --mask_prompt stuffed_toy --image_names 0,1,2,3 \
-      --entropy_alpha 3.0 --attention_layer 6
+      --no_stage1_weighting --no_stage2_weighting
+  
+  # Only Stage 2 weighting (disable Stage 1)
+  python run_inference_weighted.py --input_path ./data --mask_prompt stuffed_toy --image_names 0,1,2,3 \
+      --no_stage1_weighting
+  
+  # With visibility weighting (requires DA3)
+  python run_inference_weighted.py --input_path ./data --mask_prompt stuffed_toy --image_names 0,1,2,3 \
+      --da3_output ./da3_outputs/example/da3_output.npz --stage2_weight_source visibility
         """
     )
     
@@ -2837,75 +3001,82 @@ Examples:
     
     # Inference parameters
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--stage1_steps", type=int, default=50, help="Stage 1 steps")
-    parser.add_argument("--stage2_steps", type=int, default=25, help="Stage 2 steps")
+    parser.add_argument("--stage1_steps", type=int, default=50, help="Stage 1 (shape) inference steps")
+    parser.add_argument("--stage2_steps", type=int, default=25, help="Stage 2 (texture) inference steps")
     parser.add_argument("--decode_formats", type=str, default="gaussian,mesh", help="Decode formats")
     
-    # Weighting parameters
-    parser.add_argument("--no_weighting", action="store_true", 
-                        help="Disable entropy-based weighting (use simple average)")
-    parser.add_argument("--entropy_alpha", type=float, default=30.0,
-                        help="Gibbs temperature for entropy weighting (higher = more contrast)")
-    parser.add_argument("--attention_layer", type=int, default=6,
-                        help="Which attention layer to use for weight computation")
-    parser.add_argument("--attention_step", type=int, default=0,
-                        help="Which diffusion step to use for weight computation")
-    parser.add_argument("--min_weight", type=float, default=0.001,
-                        help="Minimum weight to prevent complete zeroing")
+    # ========================================
+    # Stage 1 (Shape) Weighting Parameters
+    # ========================================
+    parser.add_argument("--no_stage1_weighting", action="store_true",
+                        help="Disable entropy-based weighting for Stage 1 (shape generation). "
+                             "Uses simple average instead. By default, Stage 1 weighting is ENABLED.")
+    parser.add_argument("--stage1_entropy_layer", type=int, default=9,
+                        help="Stage 1: Which attention layer to use for weight computation (default: 9)")
+    parser.add_argument("--stage1_entropy_alpha", type=float, default=30.0,
+                        help="Stage 1: Gibbs temperature for entropy weighting (default: 30.0). "
+                             "Higher = more contrast/aggressive, lower = more conservative.")
     
-    # Visualization
+    # ========================================
+    # Stage 2 (Texture) Weighting Parameters
+    # ========================================
+    parser.add_argument("--no_stage2_weighting", action="store_true",
+                        help="Disable weighting for Stage 2 (texture generation). "
+                             "Uses simple average instead. By default, Stage 2 weighting is ENABLED.")
+    parser.add_argument("--stage2_weight_source", type=str, default="entropy",
+                        choices=["entropy", "visibility", "mixed"],
+                        help="Stage 2: Source for fusion weights. "
+                             "'entropy' (default): Use attention entropy only. "
+                             "'visibility': Use self-occlusion visibility (requires --da3_output). "
+                             "'mixed': Combine entropy and visibility.")
+    parser.add_argument("--stage2_entropy_alpha", type=float, default=30.0,
+                        help="Stage 2: Gibbs temperature for entropy weighting (default: 30.0). "
+                             "Higher = more contrast/aggressive, lower = more conservative.")
+    parser.add_argument("--stage2_visibility_alpha", type=float, default=30.0,
+                        help="Stage 2: Gibbs temperature for visibility weighting (default: 30.0). "
+                             "Higher = more contrast/aggressive, lower = more conservative.")
+    parser.add_argument("--stage2_attention_layer", type=int, default=6,
+                        help="Stage 2: Which attention layer to use for weight computation (default: 6)")
+    parser.add_argument("--stage2_attention_step", type=int, default=0,
+                        help="Stage 2: Which diffusion step to use for weight computation (default: 0)")
+    parser.add_argument("--stage2_min_weight", type=float, default=0.001,
+                        help="Stage 2: Minimum weight to prevent complete zeroing (default: 0.001)")
+    
+    # Stage 2 mixed mode parameters
+    parser.add_argument("--stage2_weight_combine_mode", type=str, default="average",
+                        choices=["average", "multiply"],
+                        help="Stage 2: How to combine entropy and visibility in 'mixed' mode. "
+                             "'average': weighted average. 'multiply': multiply then normalize.")
+    parser.add_argument("--stage2_visibility_weight_ratio", type=float, default=0.5,
+                        help="Stage 2: Visibility ratio in 'average' mode (0.0-1.0). "
+                             "0.0 = entropy only, 1.0 = visibility only.")
+    
+    # ========================================
+    # Visualization Parameters
+    # ========================================
     parser.add_argument("--visualize_weights", action="store_true",
                         help="Save weight and entropy visualizations")
     parser.add_argument("--save_attention", action="store_true",
                         help="Save all attention weights (for analysis)")
     parser.add_argument("--attention_layers", type=str, default=None,
                         help="Which layers to save attention for (comma-separated)")
-    
-    # Stage 2 init saving (for iteration stability analysis)
     parser.add_argument("--save_stage2_init", action="store_true",
                         help="Save Stage 2 initial latent for iteration stability analysis")
     
-    # External pointmap (from DA3)
+    # ========================================
+    # DA3 Integration Parameters
+    # ========================================
     parser.add_argument("--da3_output", type=str, default=None,
                         help="Path to DA3 output npz file (from run_da3.py). "
-                             "If provided, uses external pointmaps instead of internal depth model")
-    
-    # GLB merge visualization
+                             "Required for visibility weighting and GLB merge.")
     parser.add_argument("--merge_da3_glb", action="store_true",
-                        help="Merge SAM3D output GLB with DA3 scene.glb for comparison (requires --da3_output)")
-    
-    # Overlay visualization - overlay SAM3D result on input pointmap
+                        help="Merge SAM3D output GLB with DA3 scene.glb (requires --da3_output)")
     parser.add_argument("--overlay_pointmap", action="store_true",
-                        help="Overlay SAM3D result on input pointmap for pose visualization. "
-                             "Works with both MoGe (default) and DA3 (if --da3_output is provided)")
-    
-    # Latent visibility computation
+                        help="Overlay SAM3D result on View 0 pointmap for pose verification")
     parser.add_argument("--compute_latent_visibility", action="store_true",
-                        help="Compute and visualize latent point visibility based on GT camera poses. "
-                             "Requires --da3_output with extrinsics. Uses self-occlusion (DDA ray tracing) for visibility.")
+                        help="Compute and visualize latent visibility per view (requires --da3_output)")
     parser.add_argument("--self_occlusion_tolerance", type=float, default=4.0,
-                        help="Tolerance for self-occlusion/visibility detection (in voxel units). "
-                             "Ignore occluding voxels within this distance to avoid grazing angle issues. "
-                             "Higher values = more lenient (fewer false occlusions). "
-                             "Default: 4.0 (covers grazing angles well)")
-    
-    # Weight source selection
-    parser.add_argument("--weight_source", type=str, default="entropy",
-                        choices=["entropy", "visibility", "mixed"],
-                        help="Source for multi-view fusion weights: "
-                             "'entropy' (default): Use attention entropy only. "
-                             "'visibility': Use self-occlusion based visibility (requires DA3 for camera poses). "
-                             "'mixed': Combine entropy and visibility.")
-    parser.add_argument("--visibility_alpha", type=float, default=30.0,
-                        help="Alpha parameter for visibility weighting (higher = more contrast). Default: 30.0")
-    parser.add_argument("--weight_combine_mode", type=str, default="average",
-                        choices=["average", "multiply"],
-                        help="How to combine entropy and visibility weights in 'mixed' mode: "
-                             "'average': weighted average (1-r)*entropy + r*visibility. "
-                             "'multiply': multiply then normalize. Default: 'average'")
-    parser.add_argument("--visibility_weight_ratio", type=float, default=0.5,
-                        help="Ratio for averaging in 'mixed' mode (0.0-1.0). "
-                             "0.0 = entropy only, 1.0 = visibility only. Default: 0.5")
+                        help="Tolerance for self-occlusion detection in voxel units (default: 4.0)")
     
     args = parser.parse_args()
     
@@ -2926,24 +3097,31 @@ Examples:
             stage2_steps=args.stage2_steps,
             decode_formats=decode_formats,
             model_tag=args.model_tag,
-            use_weighting=not args.no_weighting,
-            entropy_alpha=args.entropy_alpha,
-            attention_layer=args.attention_layer,
-            attention_step=args.attention_step,
-            min_weight=args.min_weight,
+            # Stage 1 (Shape) weighting
+            stage1_weighting=not args.no_stage1_weighting,
+            stage1_entropy_layer=args.stage1_entropy_layer,
+            stage1_entropy_alpha=args.stage1_entropy_alpha,
+            # Stage 2 (Texture) weighting
+            stage2_weighting=not args.no_stage2_weighting,
+            stage2_weight_source=args.stage2_weight_source,
+            stage2_entropy_alpha=args.stage2_entropy_alpha,
+            stage2_visibility_alpha=args.stage2_visibility_alpha,
+            stage2_attention_layer=args.stage2_attention_layer,
+            stage2_attention_step=args.stage2_attention_step,
+            stage2_min_weight=args.stage2_min_weight,
+            stage2_weight_combine_mode=args.stage2_weight_combine_mode,
+            stage2_visibility_weight_ratio=args.stage2_visibility_weight_ratio,
+            # Visualization
             visualize_weights=args.visualize_weights,
             save_attention=args.save_attention,
             attention_layers_to_save=parse_attention_layers(args.attention_layers),
             save_stage2_init=args.save_stage2_init,
+            # DA3 integration
             da3_output_path=args.da3_output,
             merge_da3_glb=args.merge_da3_glb,
             overlay_pointmap=args.overlay_pointmap,
             enable_latent_visibility=args.compute_latent_visibility,
             self_occlusion_tolerance=args.self_occlusion_tolerance,
-            weight_source=args.weight_source,
-            visibility_alpha=args.visibility_alpha,
-            weight_combine_mode=args.weight_combine_mode,
-            visibility_weight_ratio=args.visibility_weight_ratio,
         )
     except Exception as e:
         logger.error(f"Inference failed: {e}")

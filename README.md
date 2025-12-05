@@ -83,7 +83,7 @@ Please follow the installation instructions in the [basic multi-view version](ht
 
 ## Quick Start
 
-### Basic Usage (Entropy Weighting)
+### Basic Usage (Both Stages Weighted by Default)
 
 ```bash
 python run_inference_weighted.py \
@@ -92,18 +92,23 @@ python run_inference_weighted.py \
     --image_names 0,1,2,3,4,5,6,7
 ```
 
+### Disable All Weighting (Simple Average)
+
+```bash
+python run_inference_weighted.py \
+    --input_path ./data/example \
+    --mask_prompt stuffed_toy \
+    --image_names 0,1,2,3,4,5,6,7 \
+    --no_stage1_weighting --no_stage2_weighting
+```
+
 ### Using Visibility Weighting (Requires DA3)
 
-To use visibility-based weighting, you need to first run Depth Anything 3 (DA3) to obtain camera poses:
+To use visibility-based weighting for Stage 2, you need to first run Depth Anything 3 (DA3) to obtain camera poses:
 
 **Step 1: Install Depth Anything 3**
 
-```bash
-# Clone and install Depth Anything 3
-git clone https://github.com/DepthAnything/Depth-Anything-V3.git
-cd Depth-Anything-V3
-pip install -e .
-```
+Please follow the installation instructions at [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3).
 
 **Step 2: Run DA3 to get camera poses**
 
@@ -121,24 +126,43 @@ python run_inference_weighted.py \
     --mask_prompt stuffed_toy \
     --image_names 0,1,2,3,4,5,6,7 \
     --da3_output ./da3_outputs/example/da3_output.npz \
-    --weight_source visibility
+    --stage2_weight_source visibility
 ```
 
 ## Key Parameters
 
+### Basic
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--input_path` | Path to input directory | Required |
 | `--mask_prompt` | Mask folder name | None |
 | `--image_names` | Image names (comma-separated) | All images |
-| `--weight_source` | Weighting strategy: `entropy`, `visibility`, or `mixed` | `entropy` |
-| `--entropy_alpha` | Entropy weighting sharpness (higher = more selective) | 30.0 |
-| `--visibility_alpha` | Visibility weighting sharpness | 30.0 |
-| `--da3_output` | Path to DA3 output (required for visibility weighting) | None |
-| `--self_occlusion_tolerance` | Tolerance for self-occlusion detection (voxel units) | 4.0 |
-| `--no_weighting` | Disable adaptive fusion (use simple average) | False |
+| `--da3_output` | Path to DA3 output (for visibility weighting) | None |
+
+### Stage 1 (Shape) Weighting
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--no_stage1_weighting` | Disable Stage 1 weighting | False (enabled) |
+| `--stage1_entropy_layer` | Attention layer for weight computation | 9 |
+| `--stage1_entropy_alpha` | Entropy weighting sharpness | 30.0 |
+
+### Stage 2 (Texture) Weighting
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--no_stage2_weighting` | Disable Stage 2 weighting | False (enabled) |
+| `--stage2_weight_source` | `entropy`, `visibility`, or `mixed` | `entropy` |
+| `--stage2_entropy_alpha` | Entropy weighting sharpness | 30.0 |
+| `--stage2_visibility_alpha` | Visibility weighting sharpness | 30.0 |
+| `--stage2_attention_layer` | Attention layer for weight computation | 6 |
+| `--self_occlusion_tolerance` | Tolerance for visibility detection | 4.0 |
+
+### Visualization
+| Parameter | Description | Default |
+|-----------|-------------|---------|
 | `--visualize_weights` | Visualize fusion weights | False |
 | `--compute_latent_visibility` | Visualize latent visibility per view | False |
+| `--overlay_pointmap` | Overlay result on View 0 pointmap | False |
+| `--merge_da3_glb` | Merge result with DA3 scene | False |
 
 📖 **Full Parameters**: See [README_PARAMETERS.md](README_PARAMETERS.md) for detailed parameter documentation.
 

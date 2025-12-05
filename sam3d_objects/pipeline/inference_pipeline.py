@@ -1013,6 +1013,11 @@ class InferencePipeline:
         use_distillation=False,
         mode: Literal['stochastic', 'multidiffusion'] = 'multidiffusion',
         attention_logger: Optional[Any] = None,
+        # SS weighting parameters
+        ss_weighting: bool = False,
+        ss_entropy_layer: int = 9,
+        ss_entropy_alpha: float = 60.0,
+        ss_warmup_steps: int = 1,
     ):
         """
         Multi-view sparse structure generation
@@ -1022,8 +1027,17 @@ class InferencePipeline:
             inference_steps: Number of inference steps
             use_distillation: Whether to use distillation
             mode: 'stochastic' or 'multidiffusion'
+            attention_logger: Optional attention logger
+            ss_weighting: Whether to use entropy-based weighting for SS
+            ss_entropy_layer: Which layer to use for entropy computation
+            ss_entropy_alpha: Alpha parameter for softmax weighting
         """
         from sam3d_objects.pipeline.multi_view_utils import inject_generator_multi_view
+        from sam3d_objects.pipeline.multi_view_weighted import (
+            SSAttentionCollector,
+            inject_ss_generator_with_collector,
+            compute_ss_entropy_weights,
+        )
         
         ss_generator = self.models["ss_generator"]
         ss_decoder = self.models["ss_decoder"]
@@ -1050,7 +1064,7 @@ class InferencePipeline:
         bs = image.shape[0]
         logger.info(
             f"Sampling sparse structure with {num_views} views: "
-            f"inference_steps={ss_generator.inference_steps}, mode={mode}"
+            f"inference_steps={ss_generator.inference_steps}, mode={mode}, ss_weighting={ss_weighting}"
         )
 
         with torch.no_grad():
@@ -1072,13 +1086,80 @@ class InferencePipeline:
                     self.ss_condition_input_mapping,
                 )
                 
-                # Inject multi-view support
+                # SS Weighting: Two-pass approach
+                shape_weights = None
+                if ss_weighting and num_views > 1:
+                    # Save random state to ensure main pass produces consistent results
+                    rng_state = torch.get_rng_state()
+                    cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+                    
+                    # Warmup steps (default: 1 to minimize impact on results)
+                    original_steps = ss_generator.inference_steps
+                    warmup_steps = min(ss_warmup_steps, original_steps) if ss_warmup_steps > 0 else 1
+                    logger.info(f"[Stage 1 Weighted] Phase 1: Warmup pass to collect attention (layer {ss_entropy_layer}, {warmup_steps} steps)...")
+                    
+                    # Set warmup steps
+                    ss_generator.inference_steps = warmup_steps
+                    
+                    # Create attention collector
+                    ss_attention_collector = SSAttentionCollector(
+                        num_views=num_views,
+                        target_layer=ss_entropy_layer,
+                    )
+                    
+                    # Warmup pass with simple average
+                    with inject_ss_generator_with_collector(
+                        ss_generator,
+                        num_views=num_views,
+                        num_steps=warmup_steps,
+                        attention_collector=ss_attention_collector,
+                        attention_logger=attention_logger,
+                    ):
+                        _ = ss_generator(
+                            latent_shape_dict,
+                            image.device,
+                            *condition_args,
+                            **condition_kwargs,
+                        )
+                    
+                    # Restore random state so main pass is not affected by warmup
+                    torch.set_rng_state(rng_state)
+                    if cuda_rng_state is not None:
+                        torch.cuda.set_rng_state(cuda_rng_state)
+                    
+                    # Compute weights from collected attention (from the last step)
+                    collected_attentions = ss_attention_collector.get_attentions()
+                    logger.info(f"[Stage 1 Weighted] Collected attention from step {ss_attention_collector._current_step} (last step of warmup)")
+                    if collected_attentions and len(collected_attentions) == num_views:
+                        shape_weights = compute_ss_entropy_weights(
+                            collected_attentions,
+                            alpha=ss_entropy_alpha,
+                        )
+                        if shape_weights is not None:
+                            logger.info(f"[Stage 1 Weighted] Computed shape weights: {shape_weights.shape}")
+                            for v in range(num_views):
+                                logger.info(f"  View {v}: mean={shape_weights[v].mean():.4f}, std={shape_weights[v].std():.4f}")
+                    else:
+                        logger.warning(f"[Stage 1 Weighted] Failed to collect attention for all views, falling back to simple average")
+                    
+                    # Restore steps
+                    ss_generator.inference_steps = original_steps
+                    
+                    # Reset attention logger for main pass
+                    if attention_logger is not None:
+                        attention_logger.start_stage("ss")
+                        attention_logger.set_num_views(num_views)
+                    
+                    logger.info(f"[Stage 1 Weighted] Phase 2: Main pass with {original_steps} steps...")
+                
+                # Main pass (with or without weights)
                 with inject_generator_multi_view(
                     ss_generator, 
                     num_views=num_views, 
                     num_steps=ss_generator.inference_steps,
                     mode=mode,
                     attention_logger=attention_logger,
+                    shape_weights=shape_weights,  # Pass computed weights
                 ) as all_view_poses_storage:
                     return_dict = ss_generator(
                         latent_shape_dict,
@@ -1459,9 +1540,14 @@ class InferencePipeline:
         stage1_only: bool = False,
         mode: Literal['stochastic', 'multidiffusion'] = 'multidiffusion',
         attention_logger: Optional[Any] = None,
-        weighting_config: Optional[Any] = None,  # Weighting config
+        weighting_config: Optional[Any] = None,  # Weighting config (Stage 2)
         save_stage2_init: bool = False,  # Whether to save Stage 2 initial latent
         save_stage2_init_path: Optional[Any] = None,  # Save path
+        # Stage 1 (SS) weighting parameters
+        ss_weighting: bool = False,
+        ss_entropy_layer: int = 9,
+        ss_entropy_alpha: float = 60.0,
+        ss_warmup_steps: int = 1,
     ) -> dict:
         """
         Main multi-view inference function
@@ -1612,6 +1698,11 @@ class InferencePipeline:
             use_distillation=use_stage1_distillation,
             mode=mode,
             attention_logger=attention_logger,
+            # SS weighting parameters
+            ss_weighting=ss_weighting,
+            ss_entropy_layer=ss_entropy_layer,
+            ss_entropy_alpha=ss_entropy_alpha,
+            ss_warmup_steps=ss_warmup_steps,
         )
         
         # Get pointmap scale/shift from the first view for pose decoding

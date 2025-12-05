@@ -23,6 +23,7 @@ def inject_generator_multi_view(
     num_steps: int,
     mode: Literal['stochastic', 'multidiffusion'] = 'multidiffusion',
     attention_logger=None,
+    shape_weights: Optional[torch.Tensor] = None,
 ):
     """
     Inject multi-view support into generator.
@@ -32,13 +33,18 @@ def inject_generator_multi_view(
         num_views: Number of views
         num_steps: Number of inference steps
         mode: 'stochastic' or 'multidiffusion'
+        attention_logger: Logger for attention capture
+        shape_weights: Optional weights for shape fusion
+            - If None: use simple average
+            - If [num_views]: use per-view weights (same weight for all latent points)
+            - If [num_views, num_latent_points]: use per-view-per-latent weights
     
     Yields:
         None (kept for API compatibility)
         
     Multi-view Iteration Strategy:
     ------------------------------
-    - Shape: All views' velocity averaged for update
+    - Shape: Weighted average (or simple average if no weights)
     - Pose: Only View 0's velocity is used (other views' pose velocity ignored)
     - Output: shape + View 0's pose
     """
@@ -146,28 +152,48 @@ def inject_generator_multi_view(
                     logger.info(f"[Multidiffusion] x_t keys: {list(x_t.keys())}")
                 if isinstance(preds[0], dict):
                     logger.info(f"[Multidiffusion] pred keys: {list(preds[0].keys())}")
-                logger.info(f"[Multidiffusion] Default mode: Shape=avg, Pose=View0")
+                if shape_weights is not None:
+                    logger.info(f"[Multidiffusion] Using weighted fusion: weights shape = {shape_weights.shape}")
+                else:
+                    logger.info(f"[Multidiffusion] Using simple average (no weights)")
+                logger.info(f"[Multidiffusion] Default mode: Shape=weighted/avg, Pose=View0")
                 _new_dynamics_multidiffusion._logged_shape = True
             
             # Fuse predictions
             if isinstance(preds[0], dict):
                 fused_pred = {}
                 for key in preds[0].keys():
-                    stacked = torch.stack([p[key] for p in preds])
+                    stacked = torch.stack([p[key] for p in preds])  # [num_views, bs, num_latent, dim]
                     if key in POSE_KEYS:
                         # Pose: View 0 only
                         fused_pred[key] = preds[0][key]
                     else:
-                        # Shape: average
-                        fused_pred[key] = stacked.mean(dim=0)
+                        # Shape: weighted average or simple average
+                        if shape_weights is not None:
+                            # Reshape weights for broadcasting
+                            # stacked: [num_views, bs, num_latent, dim]
+                            # weights: [num_views] or [num_views, num_latent]
+                            w = shape_weights
+                            if w.dim() == 1:
+                                # [num_views] -> [num_views, 1, 1, 1]
+                                w = w.view(-1, 1, 1, 1)
+                            elif w.dim() == 2:
+                                # [num_views, num_latent] -> [num_views, 1, num_latent, 1]
+                                w = w.unsqueeze(1).unsqueeze(-1)
+                            w = w.to(stacked.device, stacked.dtype)
+                            fused_pred[key] = (stacked * w).sum(dim=0)
+                        else:
+                            fused_pred[key] = stacked.mean(dim=0)
                 return fused_pred
             elif isinstance(preds[0], (list, tuple)):
+                # For non-dict outputs, apply simple average (weights not supported)
                 fused_pred = tuple(
                     torch.stack([p[i] for p in preds]).mean(dim=0)
                     for i in range(len(preds[0]))
                 )
                 return fused_pred
             else:
+                # For tensor output, apply simple average (weights not supported)
                 fused_pred = torch.stack(preds).mean(dim=0)
                 return fused_pred
         
