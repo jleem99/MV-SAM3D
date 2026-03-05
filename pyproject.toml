@@ -19,7 +19,12 @@ dynamic = ["dependencies", "optional-dependencies"]
 ignore-vcs = true
 include = ["**/*.py"]
 exclude = ["conftest.py", "*_test.py"]
-packages = ["sam3d_objects"]
+packages = ["sam3d_objects", "sam3d_notebook"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"notebook/inference.py" = "sam3d_notebook/inference.py"
+"notebook/load_images_and_masks.py" = "sam3d_notebook/load_images_and_masks.py"
+"notebook/mesh_alignment.py" = "sam3d_notebook/mesh_alignment.py"
 
 [tool.hatch.metadata.hooks.requirements_txt]
 files = ["requirements.txt"]
